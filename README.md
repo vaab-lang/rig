@@ -78,10 +78,11 @@ cd studio && npm run dev   # http://127.0.0.1:54323 → proxies API to :54321
 | Call | Purpose |
 |------|---------|
 | `rig.connect()` / `connect_with` | `RIG_DATABASE_URL` + optional `RIG_STORAGE_ROOT` |
-| `Db.connect(client.db_url)` | Open the DB in the **app** (same split as `reply file` for tape) |
-| `rig.ensure_schema(db)` | Create demo `profiles` + `todos` tables |
+| `rig.open_db(client)` / `open_url` | Open the DB and ensure `rig` tables exist |
+| `rig.ensure_schema(db)` | Create `profiles`, `todos`, and `riff_events` tables |
 | `rig.list` / `list_where` / `get` / `remove` | Allow-listed table access |
 | `rig.insert_todo` / `insert_profile` / `patch_todo_done` | Typed writes |
+| `rig.track_riff` / `count_riff` | Riff registry install telemetry |
 | `rig.require_user` / `user_view` | Auth adapter over `request.who` |
 | `rig.resolve_object` | Safe object-storage paths |
 | `rig.health` / `auth_health` | Gateway health payloads |
@@ -95,12 +96,6 @@ rig/
   studio/           # Supabase Studio–shaped dashboard (Vite + React)
   examples/server/  # full mount demo + Studio static serve
 ```
-
-## Vaab 0.1.3 boundaries
-
-A few calls fault today if done *inside* a linked riff (VM bugs, not rig design):
-`Db.connect` and some Client field reads. The demo keeps those in the app/cast
-layer — the same split tape uses for `reply file`.
 
 ## Not this repo
 

@@ -82,7 +82,22 @@ to require_env(name: Text) returns Text or fails RigError {
 }
 
 # --- database --------------------------------------------------------------
-# Open with Db.connect in the app (Vaab 0.1.3 faults on Db.connect inside riffs).
+
+to open_url(db_url: Text) returns Db or fails RigError {
+    match Db.connect(db_url) {
+        when success db then match ensure_schema(db) {
+            when success _ then { return db }
+            when failure error then { fail error }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to open_db(client: Client) returns Db or fails RigError {
+    return open_url(client.db_url)
+}
 
 to ensure_schema(db: Db) returns Int or fails RigError {
     let empty: [Text] = []
@@ -137,9 +152,11 @@ to track_riff(db: Db, name: Text, kind: Text) returns Int or fails RigError {
     if not riff_name_ok(name) {
         fail RigError.BadRequest("unknown or bad riff name")
     }
-    let id = "{name}-{kind}-{now()}"
+    let existing = try count_riff(db, name)
+    let next = existing + 1
+    let id = "{name}-{kind}-{now()}-{next}"
     match db.from("riff_events").insert({"id": id, "name": name, "kind": kind, "ts": "{now()}"}) {
-        when success count then { return count }
+        when success _ then { return next }
         when failure error then match error {
             when Failed(message) then { fail RigError.Database(message) }
         }

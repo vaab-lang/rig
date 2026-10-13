@@ -9,7 +9,7 @@
 # Studio UI:  http://127.0.0.1:54321/
 # API:        http://127.0.0.1:54321/rest/v1/...
 
-need rig of RigError, Client, User, UserView, Health, NewTodo, OkCount, Todo, connect, connect_with, require_env, ensure_schema, allow_table, list, list_where, get, insert_todo, insert_profile, patch_todo_done, remove, require_user, user_view, resolve_object, health, auth_health
+need rig of RigError, Client, User, UserView, Health, NewTodo, OkCount, Todo, connect, connect_with, open_db, open_url, require_env, ensure_schema, allow_table, list, list_where, get, insert_todo, insert_profile, patch_todo_done, remove, require_user, user_view, resolve_object, health, auth_health
 
 type StudioTable {
     name: Text
@@ -42,25 +42,8 @@ serve on port 54321 {
     }
 
     route get "/rest/v1/todos" {
-        match RigRoutes.db_url() {
-            when success url then match Db.connect(url) {
-                when success db then {
-                    let empty: [Text] = []
-                    match db.execute(
-                        "create table if not exists todos (id text primary key, title text not null, owner text not null, done text not null default 'false')",
-                        empty,
-                    ) {
-                        when success _ then match db.from("todos").order_desc("id").all() {
-                            when success rows then { reply with rows }
-                            when failure error then { reply text "query" as "text/plain" status 500 }
-                        }
-                        when failure error then { reply text "schema" as "text/plain" status 500 }
-                    }
-                }
-                when failure error then match error {
-                    when Failed(message) then { reply text message as "text/plain" status 500 }
-                }
-            }
+        match RigRoutes.list_todos() {
+            when success rows then { reply with rows }
             when failure error then { reply text explain(error) as "text/plain" status 500 }
         }
     }
@@ -73,25 +56,8 @@ serve on port 54321 {
     }
 
     route get "/rest/v1/profiles" {
-        match RigRoutes.db_url() {
-            when success url then match Db.connect(url) {
-                when success db then {
-                    let empty: [Text] = []
-                    match db.execute(
-                        "create table if not exists profiles (id text primary key, email text not null, name text not null default '')",
-                        empty,
-                    ) {
-                        when success _ then match db.from("profiles").order_desc("id").all() {
-                            when success rows then { reply with rows }
-                            when failure error then { reply text "query" as "text/plain" status 500 }
-                        }
-                        when failure error then { reply text "schema" as "text/plain" status 500 }
-                    }
-                }
-                when failure error then match error {
-                    when Failed(message) then { reply text message as "text/plain" status 500 }
-                }
-            }
+        match RigRoutes.list_profiles() {
+            when success rows then { reply with rows }
             when failure error then { reply text explain(error) as "text/plain" status 500 }
         }
     }
@@ -202,6 +168,21 @@ cast RigRoutes {
         }
     }
 
+    factory db() returns Db or fails RigError {
+        let client = try RigRoutes.client()
+        return open_db(client)
+    }
+
+    factory list_todos() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return list(db, "todos")
+    }
+
+    factory list_profiles() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return list(db, "profiles")
+    }
+
     factory user(who: User or fails AuthError) returns UserView or fails RigError {
         let user = try require_user(who)
         return user_view(user)
@@ -209,28 +190,10 @@ cast RigRoutes {
 
     factory create_todo(who: User or fails AuthError, body: NewTodo) returns OkCount or fails RigError {
         let user = try require_user(who)
-        let url = try RigRoutes.db_url()
-        match Db.connect(url) {
-            when success db then {
-                let empty: [Text] = []
-                match db.execute(
-                    "create table if not exists todos (id text primary key, title text not null, owner text not null, done text not null default 'false')",
-                    empty,
-                ) {
-                    when success _ then {
-                        let id = "{user.id}-{body.title}"
-                        let count = try insert_todo(db, id, body.title, user.id)
-                        return OkCount.new(count: count)
-                    }
-                    when failure error then match error {
-                        when Failed(message) then { fail RigError.Database(message) }
-                    }
-                }
-            }
-            when failure error then match error {
-                when Failed(message) then { fail RigError.Database(message) }
-            }
-        }
+        let db = try RigRoutes.db()
+        let id = "{user.id}-{body.title}"
+        let count = try insert_todo(db, id, body.title, user.id)
+        return OkCount.new(count: count)
     }
 
     factory storage_file(filepath: Text) returns Text or fails RigError {
