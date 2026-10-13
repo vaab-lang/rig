@@ -1,0 +1,292 @@
+# rig — Vaab's own Supabase-shaped backend helpers.
+#
+# tape is the static file deck. rig is the full backline: database REST,
+# auth (via request.who), and object storage paths — mounted from a serve block.
+#
+#   need rig
+#   let client = try rig.connect()
+#   let db = try Db.connect(client.db_url)   # app opens Db (like reply file for tape)
+#   try rig.ensure_schema(db)
+#   let rows = try rig.list(db, "todos")
+
+choice RigError {
+    Missing(name: Text)
+    Database(message: Text)
+    Unauthorized
+    BadRequest(message: Text)
+    NotFound(resource: Text)
+    Forbidden(table: Text)
+    Unsafe(requested: Text)
+}
+
+type Client {
+    db_url: Text
+    storage_root: Text
+}
+
+type Health {
+    name: Text
+    ok: Bool
+    version: Text
+}
+
+# Same shape request.who expects (apps share this type via need rig).
+type User {
+    id: Text
+    email: Text
+}
+
+type UserView {
+    id: Text
+    email: Text
+}
+
+type Todo {
+    id: Text
+    title: Text
+    owner: Text
+    done: Text
+}
+
+type NewTodo {
+    title: Text
+}
+
+type OkCount {
+    count: Int
+}
+
+# --- connect ---------------------------------------------------------------
+
+to connect() returns Client or fails RigError {
+    match require_env("RIG_DATABASE_URL") {
+        when success db_url then match env.get("RIG_STORAGE_ROOT") {
+            when found root then { return Client.new(db_url: db_url, storage_root: root) }
+            when nothing then {
+                return Client.new(db_url: db_url, storage_root: "rig-storage")
+            }
+        }
+        when failure error then { fail error }
+    }
+}
+
+to connect_with(db_url: Text, storage_root: Text) returns Client {
+    return Client.new(db_url: db_url, storage_root: storage_root)
+}
+
+to require_env(name: Text) returns Text or fails RigError {
+    match env.get(name) {
+        when found value then { return value }
+        when nothing then { fail RigError.Missing(name) }
+    }
+}
+
+# --- database --------------------------------------------------------------
+# Open with Db.connect in the app (Vaab 0.1.3 faults on Db.connect inside riffs).
+
+to ensure_schema(db: Db) returns Int or fails RigError {
+    let empty: [Text] = []
+    match db.execute(
+        "create table if not exists profiles (id text primary key, email text not null, name text not null default '')",
+        empty,
+    ) {
+        when success _ then {}
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+    match db.execute(
+        "create table if not exists todos (id text primary key, title text not null, owner text not null, done text not null default 'false')",
+        empty,
+    ) {
+        when success _ then {}
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+    match db.execute(
+        "create table if not exists riff_events (id text primary key, name text not null, kind text not null, ts text not null)",
+        empty,
+    ) {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+# --- riff registry telemetry (riff.vaab.dev) --------------------------------
+
+to known_riff(name: Text) returns Bool {
+    if name == "supabase" { return yes }
+    if name == "tape" { return yes }
+    if name == "rig" { return yes }
+    return no
+}
+
+to riff_name_ok(name: Text) returns Bool {
+    if name.is_empty { return no }
+    if name.contains("..") { return no }
+    if name.contains("/") { return no }
+    if name.contains(":") { return no }
+    if name.contains(" ") { return no }
+    return known_riff(name)
+}
+
+to track_riff(db: Db, name: Text, kind: Text) returns Int or fails RigError {
+    if not riff_name_ok(name) {
+        fail RigError.BadRequest("unknown or bad riff name")
+    }
+    let id = "{name}-{kind}-{now()}"
+    match db.from("riff_events").insert({"id": id, "name": name, "kind": kind, "ts": "{now()}"}) {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to count_riff(db: Db, name: Text) returns Int or fails RigError {
+    if not riff_name_ok(name) {
+        fail RigError.BadRequest("unknown or bad riff name")
+    }
+    match db.from("riff_events").equals("name", name).count() {
+        when success n then { return n }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to allow_table(table: Text) returns Text or fails RigError {
+    if table == "todos" { return table }
+    if table == "profiles" { return table }
+    fail RigError.Forbidden(table)
+}
+
+to list(db: Db, table: Text) returns [{Text: Text}] or fails RigError {
+    if table != "todos" {
+        if table != "profiles" {
+            fail RigError.Forbidden(table)
+        }
+    }
+    match db.from(table).order_desc("id").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to list_where(db: Db, table: Text, column: Text, value: Text) returns [{Text: Text}] or fails RigError {
+    if table != "todos" {
+        if table != "profiles" {
+            fail RigError.Forbidden(table)
+        }
+    }
+    match db.from(table).equals(column, value).order_desc("id").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to get(db: Db, table: Text, id: Text) returns {Text: Text} or fails RigError {
+    if table != "todos" {
+        if table != "profiles" {
+            fail RigError.Forbidden(table)
+        }
+    }
+    match db.from(table).equals("id", id).first() {
+        when success maybe then match maybe {
+            when found row then { return row }
+            when nothing then { fail RigError.NotFound(id) }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to insert_todo(db: Db, id: Text, title: Text, owner: Text) returns Int or fails RigError {
+    match db.from("todos").insert({"id": id, "title": title, "owner": owner, "done": "false"}) {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to insert_profile(db: Db, id: Text, email: Text, name: Text) returns Int or fails RigError {
+    match db.from("profiles").insert({"id": id, "email": email, "name": name}) {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to patch_todo_done(db: Db, id: Text, done: Text) returns Int or fails RigError {
+    match db.from("todos").equals("id", id).update({"done": done}) {
+        when success count then {
+            if count == 0 { fail RigError.NotFound(id) }
+            return count
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to remove(db: Db, table: Text, id: Text) returns Int or fails RigError {
+    if table != "todos" {
+        if table != "profiles" {
+            fail RigError.Forbidden(table)
+        }
+    }
+    match db.from(table).equals("id", id).delete() {
+        when success count then {
+            if count == 0 { fail RigError.NotFound(id) }
+            return count
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+# --- auth (builtin request.who; rig only adapts) ---------------------------
+
+to require_user(who: User or fails AuthError) returns User or fails RigError {
+    match who {
+        when success user then { return user }
+        when failure _ then { fail RigError.Unauthorized }
+    }
+}
+
+to user_view(user: User) returns UserView {
+    return UserView.new(id: user.id, email: user.email)
+}
+
+# --- object storage paths (tape's sibling for /storage) --------------------
+
+to resolve_object(root: Text, requested: Text) returns Text or fails RigError {
+    if requested.contains("..") {
+        fail RigError.Unsafe(requested)
+    }
+    if requested.is_empty {
+        fail RigError.BadRequest("empty object path")
+    }
+    return "{root}/{requested}"
+}
+
+# --- health ----------------------------------------------------------------
+
+to health() returns Health {
+    return Health.new(name: "rig", ok: yes, version: "0.1.0")
+}
+
+to auth_health() returns Health {
+    return Health.new(name: "rig-auth", ok: yes, version: "0.1.0")
+}

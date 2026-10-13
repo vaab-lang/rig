@@ -1,0 +1,6 @@
+rig.db
+rig.db-*
+*.vaab.kv
+rig-storage/
+examples/server/needed.lock
+.DS_Store

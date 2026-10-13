@@ -1,0 +1,134 @@
+# rig server — mount Vaab's Supabase-shaped backline.
+#
+#   cd examples/server
+#   /path/to/vaab gather
+#   RIG_DATABASE_URL=sqlite:../../rig.db AUTH_SECRET=dev \
+#     /path/to/vaab serve main.vaab
+
+need rig of RigError, Client, User, UserView, Health, NewTodo, OkCount, Todo, connect, connect_with, require_env, ensure_schema, allow_table, list, list_where, get, insert_todo, insert_profile, patch_todo_done, remove, require_user, user_view, resolve_object, health, auth_health
+
+serve on port 54321 {
+    route get "/health" {
+        reply with health()
+    }
+
+    route get "/auth/v1/health" {
+        reply with auth_health()
+    }
+
+    route get "/auth/v1/user" {
+        reply with try RigRoutes.user(request.who)
+    }
+
+    route get "/rest/v1/todos" {
+        reply with try RigRoutes.list_todos()
+    }
+
+    route post "/rest/v1/todos" expecting NewTodo as body {
+        reply with try RigRoutes.create_todo(request.who, body) status 201
+    }
+
+    route get "/rest/v1/profiles" {
+        reply with try RigRoutes.list_profiles()
+    }
+
+    route get "/storage/v1/object/{*filepath}" {
+        match RigRoutes.storage_file(filepath) {
+            when success target then {
+                reply file target
+            }
+            when failure error then match error {
+                when Unsafe(requested) then {
+                    reply text "forbidden" as "text/plain; charset=utf-8" status 403
+                }
+                when BadRequest(message) then {
+                    reply text message as "text/plain; charset=utf-8" status 400
+                }
+                when NotFound(resource) then {
+                    reply text "not found" as "text/plain; charset=utf-8" status 404
+                }
+                when Missing(name) then {
+                    reply text "missing {name}" as "text/plain; charset=utf-8" status 500
+                }
+                when Database(message) then {
+                    reply text message as "text/plain; charset=utf-8" status 500
+                }
+                when Unauthorized then {
+                    reply text "unauthorized" as "text/plain; charset=utf-8" status 401
+                }
+                when Forbidden(table) then {
+                    reply text "forbidden table {table}" as "text/plain; charset=utf-8" status 403
+                }
+            }
+        }
+    }
+
+    when anything fails with RigError as error {
+        reply explain(error)
+    }
+}
+
+cast RigRoutes {
+    factory client() returns Client or fails RigError {
+        match env.get("RIG_DATABASE_URL") {
+            when found url then match env.get("RIG_STORAGE_ROOT") {
+                when found root then { return connect_with(url, root) }
+                when nothing then { return connect_with(url, "rig-storage") }
+            }
+            when nothing then { return try connect() }
+        }
+    }
+
+    factory db() returns Db or fails RigError {
+        let client = try RigRoutes.client()
+        match Db.connect(client.db_url) {
+            when success db then {
+                try ensure_schema(db)
+                return db
+            }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+
+    factory user(who: User or fails AuthError) returns UserView or fails RigError {
+        let user = try require_user(who)
+        return user_view(user)
+    }
+
+    factory list_todos() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        # Query in the app layer — fluent Query results from riff helpers
+        # currently fault when replied over HTTP (Vaab 0.1.3).
+        match db.from("todos").order_desc("id").all() {
+            when success rows then { return rows }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+
+    factory list_profiles() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        match db.from("profiles").order_desc("id").all() {
+            when success rows then { return rows }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+
+    factory create_todo(who: User or fails AuthError, body: NewTodo) returns OkCount or fails RigError {
+        let user = try require_user(who)
+        let db = try RigRoutes.db()
+        let id = "{user.id}-{body.title}"
+        let count = try insert_todo(db, id, body.title, user.id)
+        return OkCount.new(count: count)
+    }
+
+    factory storage_file(filepath: Text) returns Text or fails RigError {
+        let client = try RigRoutes.client()
+        return try resolve_object(client.storage_root, filepath)
+    }
+}
