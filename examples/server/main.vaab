@@ -154,20 +154,6 @@ cast RigRoutes {
         }
     }
 
-    factory db_url() returns Text or fails RigError {
-        match env.get("RIG_DATABASE_URL") {
-            when found url then { return url }
-            when nothing then { fail RigError.Missing("RIG_DATABASE_URL") }
-        }
-    }
-
-    factory storage_root() returns Text or fails RigError {
-        match env.get("RIG_STORAGE_ROOT") {
-            when found root then { return root }
-            when nothing then { return "rig-storage" }
-        }
-    }
-
     factory db() returns Db or fails RigError {
         let client = try RigRoutes.client()
         return open_db(client)
@@ -197,14 +183,14 @@ cast RigRoutes {
     }
 
     factory storage_file(filepath: Text) returns Text or fails RigError {
-        let root = try RigRoutes.storage_root()
-        return try resolve_object(root, filepath)
+        let client = try RigRoutes.client()
+        return try resolve_object(client.storage_root, filepath)
     }
 
     factory storage_listing() returns StudioStorage or fails RigError {
-        let root = try RigRoutes.storage_root()
+        let client = try RigRoutes.client()
         let empty: [Text] = []
-        return StudioStorage.new(root: root, entries: empty)
+        return StudioStorage.new(root: client.storage_root, entries: empty)
     }
 
     factory run_select(sql: Text) returns [{Text: Text}] or fails RigError {
@@ -230,8 +216,8 @@ cast RigRoutes {
         if lowered.contains(";") {
             fail RigError.BadRequest("single statement only")
         }
-        let url = try RigRoutes.db_url()
-        match Db.connect(url) {
+        let client = try RigRoutes.client()
+        match Db.connect(client.db_url) {
             when success db then {
                 let empty: [Text] = []
                 match db.query(sql, empty) {

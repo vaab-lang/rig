@@ -2,4 +2,4 @@ riff rig 0.1.0
 description Supabase-shaped backend helpers for Vaab — data API, auth, object storage, and riff install tracking
 by vaab-lang
 licence MIT
-needs vaab at 0.1
+needs vaab at 0.1.4

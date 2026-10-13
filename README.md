@@ -40,9 +40,9 @@ Catalog: [riff.vaab.dev](https://riff.vaab.dev) (install counts stored via rig i
 `tape` does not open the HTTP server — your `serve` block does, then calls
 `tape.resolve` before `reply file`.
 
-`rig` does not open the database — your app calls `Db.connect`, then
-`rig.ensure_schema` / `rig.insert_*` / … inside routes. Auth stays
-`request.who`; rig only adapts it.
+`rig` is the same split for data: your `serve` block mounts routes, then calls
+`rig.open_db(client)` / `rig.list` / … Auth stays `request.who`; rig only adapts
+it. **Requires Vaab ≥ 0.1.4** (linked-riff Db / NodeId fixes).
 
 ## Example mount + Studio
 

@@ -2,5 +2,5 @@ riff rig_server 0.1.0
 description Demo HTTP mount of the rig backend (Supabase-shaped routes)
 by vaab-lang
 licence MIT
-needs vaab at 0.1
+needs vaab at 0.1.4
 need rig from ../..
