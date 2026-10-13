@@ -33,7 +33,7 @@ Catalog: [riff.vaab.dev](https://riff.vaab.dev) (install counts stored via rig i
 | Storage | `rig.resolve_object(root, path)` for `/storage/v1/object/...` |
 | Edge Functions | Your own `route` blocks in Vaab |
 | Realtime | Language `Hub` / `socket` (planned) — not duplicated here |
-| Studio | Not in v0.1 |
+| Studio | [`studio/`](studio/) dashboard (Table / SQL / Auth / Storage / API) |
 
 ## Same shape as tape
 
@@ -44,25 +44,33 @@ Catalog: [riff.vaab.dev](https://riff.vaab.dev) (install counts stored via rig i
 `rig.ensure_schema` / `rig.insert_*` / … inside routes. Auth stays
 `request.who`; rig only adapts it.
 
-## Example mount
+## Example mount + Studio
 
 See the full gateway demo in [`examples/server`](examples/server)
-(Supabase-shaped `/auth`, `/rest`, `/storage` routes on port `54321`).
+(Supabase-shaped `/auth`, `/rest`, `/storage` on port `54321`, plus a Studio UI).
 
 ```bash
+cd studio && npm install && npm run build && cd ..
 cd examples/server
 /path/to/vaab gather
 RIG_DATABASE_URL=sqlite:../../rig.db AUTH_SECRET=dev \
   /path/to/vaab serve main.vaab
 ```
 
-Then:
+Open **http://127.0.0.1:54321/** for rig Studio (icon rail: Table Editor, SQL,
+Auth, Storage, API Docs — same shape as Supabase Studio).
 
 ```bash
 curl -s localhost:54321/health
 curl -s localhost:54321/auth/v1/health
-curl -s localhost:54321/rest/v1/todos \
-  -H "Authorization: Bearer <id>|<email>|<hmac>"
+curl -s localhost:54321/rest/v1/todos
+curl -s localhost:54321/studio-api/tables
+```
+
+For UI hot-reload against a running gateway:
+
+```bash
+cd studio && npm run dev   # http://127.0.0.1:54323 → proxies API to :54321
 ```
 
 ## API
@@ -84,7 +92,8 @@ curl -s localhost:54321/rest/v1/todos \
 rig/
   riff              # manifest
   lib.vaab          # helpers
-  examples/server/  # full mount demo
+  studio/           # Supabase Studio–shaped dashboard (Vite + React)
+  examples/server/  # full mount demo + Studio static serve
 ```
 
 ## Vaab 0.1.3 boundaries

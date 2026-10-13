@@ -4,3 +4,5 @@ rig.db-*
 rig-storage/
 examples/server/needed.lock
 .DS_Store
+studio/node_modules/
+studio/dist/
