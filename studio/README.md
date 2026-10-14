@@ -1,10 +1,10 @@
 # rig studio
 
-Local dashboard for a rig gateway — same product shape as [Supabase Studio](https://github.com/supabase/supabase/tree/master/apps/studio):
+Local dashboard for a rig gateway. Graphite console, tungsten accent, IBM Plex.
 
-- Icon rail navigation (Home, Table Editor, SQL Editor, Database, Auth, Storage, API, Settings)
-- Dark theme with green accent
-- Table grid + insert, read-only SQL, API docs
+- Pedalboard nav (icons / full labels, `rig.studio.nav`, ⌘B, mobile sheet)
+- Table Editor, SQL Editor (CodeMirror), Auth, Storage, API, Settings
+- Served under `/studio/`
 
 ## Develop
 
@@ -16,12 +16,14 @@ RIG_DATABASE_URL=sqlite:../../rig.db AUTH_SECRET=dev vaab serve main.vaab
 # terminal 2 — UI
 npm install
 npm run dev
-# → http://127.0.0.1:54323
+# → http://127.0.0.1:54323/studio/
 ```
+
+Studio Basic auth on the gateway: `admin` / `secret`.
 
 ## Ship with the gateway
 
 ```bash
 npm run build
-# examples/server serves ../../studio/dist at /
+# examples/server serves ../../studio/dist at /studio/
 ```

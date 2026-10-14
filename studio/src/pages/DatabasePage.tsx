@@ -1,39 +1,57 @@
-import { useEffect, useState } from 'react'
-import { listTables, type TableInfo } from '../lib/api'
+import { useLocation } from 'react-router-dom'
+import { DatabaseSettingsPage } from './database/DatabaseSettings'
+import { MigrationsLedger } from './database/MigrationsLedger'
+import {
+  ExtensionsCatalog,
+  FunctionsCatalog,
+  IndexesCatalog,
+  PublicationsCatalog,
+  RolesCatalog,
+  TriggersCatalog,
+  TypesCatalog,
+} from './database/objects'
+import { PoliciesCatalog } from './database/PoliciesCatalog'
+import { SchemaVisualizerPage } from './database/SchemaVisualizer'
+import { TablesCatalog } from './database/TablesCatalog'
+import { WebhooksCatalog } from './database/WebhooksCatalog'
+
+function databaseLeaf(pathname: string): string {
+  const trimmed = pathname.replace(/\/+$/, '') || '/'
+  if (trimmed === '/database' || trimmed === '/database/tables') return 'tables'
+  if (trimmed.startsWith('/database/')) return trimmed.slice('/database/'.length)
+  return 'tables'
+}
 
 export function DatabasePage() {
-  const [tables, setTables] = useState<TableInfo[]>([])
-  const [error, setError] = useState<string | null>(null)
+  const { pathname } = useLocation()
 
-  useEffect(() => {
-    listTables()
-      .then(setTables)
-      .catch((err: Error) => setError(err.message))
-  }, [])
-
-  return (
-    <div className="content">
-      <h1 className="page-title">Database</h1>
-      <p className="page-sub">Schema surfaces exposed through the rig allow-list.</p>
-      {error ? <div className="error-banner">{error}</div> : null}
-      <div className="table-wrap">
-        <table className="data">
-          <thead>
-            <tr>
-              <th>table</th>
-              <th>columns</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tables.map((table) => (
-              <tr key={table.name}>
-                <td className="mono">{table.name}</td>
-                <td className="mono">{table.columns.join(', ')}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  )
+  switch (databaseLeaf(pathname)) {
+    case 'schemas':
+      return <SchemaVisualizerPage />
+    case 'functions':
+      return <FunctionsCatalog />
+    case 'triggers':
+      return <TriggersCatalog />
+    case 'types':
+      return <TypesCatalog />
+    case 'extensions':
+      return <ExtensionsCatalog />
+    case 'indexes':
+      return <IndexesCatalog />
+    case 'publications':
+      return <PublicationsCatalog />
+    case 'roles':
+      return <RolesCatalog />
+    case 'policies':
+      return <PoliciesCatalog />
+    case 'migrations':
+      return <MigrationsLedger />
+    case 'webhooks':
+      return <WebhooksCatalog />
+    case 'settings':
+      return <DatabaseSettingsPage />
+    case 'tables':
+    default:
+      return <TablesCatalog />
+  }
 }

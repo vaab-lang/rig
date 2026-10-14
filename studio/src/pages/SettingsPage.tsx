@@ -1,42 +1,34 @@
+import { useLocation } from 'react-router-dom'
+import { menuLinkFromPath } from '@/lib/studio-nav'
+import { PageHeader } from '@/pages/home/ui'
+import { AppearancePane } from '@/pages/settings/AppearancePane'
+import { ApiPane } from '@/pages/settings/ApiPane'
+import { ComputePane } from '@/pages/settings/ComputePane'
+import { GeneralPane } from '@/pages/settings/GeneralPane'
+import { InfrastructurePane } from '@/pages/settings/InfrastructurePane'
+import { JwtPane } from '@/pages/settings/JwtPane'
+import { KeysPane } from '@/pages/settings/KeysPane'
+import { LogsPane } from '@/pages/settings/LogsPane'
+
+function paneFor(pathname: string) {
+  if (pathname.endsWith('/compute')) return <ComputePane />
+  if (pathname.endsWith('/infrastructure')) return <InfrastructurePane />
+  if (pathname.endsWith('/api')) return <ApiPane />
+  if (pathname.endsWith('/keys')) return <KeysPane />
+  if (pathname.endsWith('/jwt')) return <JwtPane />
+  if (pathname.endsWith('/logs')) return <LogsPane />
+  if (pathname.endsWith('/appearance')) return <AppearancePane />
+  return <GeneralPane />
+}
+
 export function SettingsPage() {
+  const { pathname } = useLocation()
+  const title = menuLinkFromPath(pathname)?.label ?? 'General'
+
   return (
-    <div className="content">
-      <h1 className="page-title">Project Settings</h1>
-      <p className="page-sub">
-        Like self-hosted Supabase Studio, project settings live outside the dashboard — in env vars
-        and your `serve` block.
-      </p>
-
-      <div className="grid-cards">
-        <div className="card">
-          <h4>RIG_DATABASE_URL</h4>
-          <p>SQLite (or Postgres URL once Vaab supports live PG).</p>
-          <div className="value" style={{ fontSize: 13 }}>
-            sqlite:../../rig.db
-          </div>
-        </div>
-        <div className="card">
-          <h4>AUTH_SECRET</h4>
-          <p>HMAC secret for bearer tokens.</p>
-          <div className="value" style={{ fontSize: 13 }}>
-            dev
-          </div>
-        </div>
-        <div className="card">
-          <h4>RIG_STORAGE_ROOT</h4>
-          <p>Filesystem root for `/storage/v1/object`.</p>
-          <div className="value" style={{ fontSize: 13 }}>
-            rig-storage
-          </div>
-        </div>
-      </div>
-
-      <pre className="code-block" style={{ marginTop: 20 }}>{`cd examples/server
-vaab gather
-RIG_DATABASE_URL=sqlite:../../rig.db AUTH_SECRET=dev \\
-  vaab serve main.vaab
-# Studio UI: http://127.0.0.1:54321/
-# API:       http://127.0.0.1:54321/rest/v1/...`}</pre>
+    <div className="p-4 md:p-6">
+      <PageHeader title={title} detail="Project identity, keys, and Studio prefs." />
+      {paneFor(pathname)}
     </div>
   )
 }

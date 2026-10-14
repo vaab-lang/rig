@@ -1,13 +1,17 @@
 # rig — Vaab's own Supabase-shaped backend helpers.
 #
 # tape is the static file deck. rig is the full backline: database REST,
-# auth (via request.who), and object storage paths — mounted from a serve block.
+# auth (via request.who), object storage paths, and a precompiled Studio UI —
+# all mounted from a serve block.
 #
 #   need rig
-#   let client = try rig.connect()
-#   let db = try Db.connect(client.db_url)   # app opens Db (like reply file for tape)
-#   try rig.ensure_schema(db)
-#   let rows = try rig.list(db, "todos")
+#
+#   serve on port 54321 {
+#       mount rig_auth at "/auth/v1"
+#       mount rig_api at "/rest/v1"
+#       mount rig_storage at "/storage/v1"
+#       mount rig_studio at "/studio"
+#   }
 
 choice RigError {
     Missing(name: Text)
@@ -99,31 +103,142 @@ to open_db(client: Client) returns Db or fails RigError {
     return open_url(client.db_url)
 }
 
-to ensure_schema(db: Db) returns Int or fails RigError {
+to exec_sql(db: Db, sql: Text) returns Int or fails RigError {
     let empty: [Text] = []
-    match db.execute(
-        "create table if not exists profiles (id text primary key, email text not null, name text not null default '')",
-        empty,
-    ) {
-        when success _ then {}
-        when failure error then match error {
-            when Failed(message) then { fail RigError.Database(message) }
-        }
-    }
-    match db.execute(
-        "create table if not exists todos (id text primary key, title text not null, owner text not null, done text not null default 'false')",
-        empty,
-    ) {
-        when success _ then {}
-        when failure error then match error {
-            when Failed(message) then { fail RigError.Database(message) }
-        }
-    }
-    match db.execute(
-        "create table if not exists riff_events (id text primary key, name text not null, kind text not null, ts text not null)",
-        empty,
-    ) {
+    match db.execute(sql, empty) {
         when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to query_sql(db: Db, sql: Text) returns [{Text: Text}] or fails RigError {
+    let empty: [Text] = []
+    match db.query(sql, empty) {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to row_text(row: {Text: Text}, key: Text) returns Text {
+    return row.get(key) otherwise ""
+}
+
+to empty_rows() returns [{Text: Text}] {
+    let none: [{Text: Text}] = []
+    return none
+}
+
+to pragma_rows(db: Db, sql: Text) returns [{Text: Text}] {
+    let empty: [Text] = []
+    match db.query(sql, empty) {
+        when success rows then { return rows }
+        when failure _ then { return empty_rows() }
+    }
+}
+
+to ident_ok(name: Text) returns Bool {
+    if name.is_empty { return no }
+    if name.contains(" ") { return no }
+    if name.contains(";") { return no }
+    if name.contains("'") { return no }
+    if name.contains("\"") { return no }
+    if name.contains("`") { return no }
+    if name.contains("[") { return no }
+    if name.contains("]") { return no }
+    if name.contains("(") { return no }
+    if name.contains(")") { return no }
+    if name.contains(",") { return no }
+    if name.contains(".") { return no }
+    if name.contains("/") { return no }
+    if name.contains("\\") { return no }
+    if name.contains("=") { return no }
+    if name.contains("*") { return no }
+    if name.contains("%") { return no }
+    if name.contains("#") { return no }
+    if name.contains("-") { return no }
+    if name.contains("--") { return no }
+    if name.contains("/*") { return no }
+    return yes
+}
+
+to ident(name: Text) returns Text or fails RigError {
+    if ident_ok(name) {
+        return name
+    }
+    fail RigError.BadRequest("bad identifier: {name}")
+}
+
+to names_ok(names: [Text], i: Int) returns Bool {
+    if i >= names.count { return yes }
+    if not ident_ok(names[i]) { return no }
+    return names_ok(names, i + 1)
+}
+
+to values_ok(values: {Text: Text}) returns Bool {
+    return names_ok(values.keys, 0)
+}
+
+to is_sqlite_name(name: Text) returns Bool {
+    if name.contains("sqlite_") { return yes }
+    if name == "sqlite_master" { return yes }
+    return no
+}
+
+to is_credential_table(name: Text) returns Bool {
+    if name == "studio_config" { return yes }
+    return no
+}
+
+to allow_user_table(table: Text) returns Text or fails RigError {
+    let name = try ident(table)
+    if is_sqlite_name(name) {
+        fail RigError.Forbidden(name)
+    }
+    if is_credential_table(name) {
+        fail RigError.Forbidden(name)
+    }
+    return name
+}
+
+to ensure_schema(db: Db) returns Int or fails RigError {
+    let _p = try exec_sql(db, "create table if not exists profiles (id text primary key, email text not null, name text not null default '')")
+    let _t = try exec_sql(db, "create table if not exists todos (id text primary key, title text not null, owner text not null, done text not null default 'false')")
+    let _r = try exec_sql(db, "create table if not exists riff_events (id text primary key, name text not null, kind text not null, ts text not null)")
+    let _c = try exec_sql(db, "create table if not exists studio_config (key text primary key, value text not null)")
+    let _u = try exec_sql(db, "create table if not exists auth_users (id text primary key, email text not null, phone text not null default '', provider text not null default 'email', created_at text not null, last_sign_in_at text not null default '', raw_user_meta_data text not null default '', banned_until text not null default '')")
+    let _b = try exec_sql(db, "create table if not exists studio_buckets (id text primary key, name text not null, public text not null default 'false', file_size_limit text not null default '', allowed_mime_types text not null default '', created_at text not null, updated_at text not null)")
+    let _o = try exec_sql(db, "create table if not exists studio_objects (id text primary key, bucket_id text not null, name text not null, size text not null default '0', mime_type text not null default '', content text not null default '', created_at text not null, updated_at text not null)")
+    let _s = try exec_sql(db, "create table if not exists studio_snippets (id text primary key, name text not null, description text not null default '', sql text not null default '', folder text not null default 'Private', favorite text not null default 'false', visibility text not null default 'private', updated_at text not null)")
+    let _l = try exec_sql(db, "create table if not exists studio_policies (id text primary key, schema_name text not null default 'public', table_name text not null, name text not null, action text not null default 'PERMISSIVE', roles text not null default 'public', command text not null, definition text not null default 'true', check_expr text not null default '')")
+    let _f = try exec_sql(db, "create table if not exists studio_functions (id text primary key, slug text not null, name text not null, status text not null default 'active', version text not null default '1', entrypoint_path text not null default 'index.ts', verify_jwt text not null default 'true', code text not null default '', created_at text not null, updated_at text not null)")
+    let _m = try exec_sql(db, "create table if not exists studio_migrations (version text primary key, name text not null, statements text not null default '', applied_at text not null)")
+    let _g = try exec_sql(db, "create table if not exists studio_logs (id text primary key, ts text not null, service text not null, level text not null, status_code text not null default '', method text not null default '', path text not null default '', msg text not null default '', duration_ms text not null default '0')")
+    let _w = try exec_sql(db, "create table if not exists studio_webhooks (id text primary key, name text not null, table_name text not null, events text not null default '', url text not null, method text not null default 'POST', headers text not null default '', enabled text not null default 'true', created_at text not null)")
+    return try seed_studio(db)
+}
+
+to seed_studio(db: Db) returns Int or fails RigError {
+    match db.from("studio_snippets").count() {
+        when success n then {
+            if n > 0 { return n }
+            let ts = "{now()}"
+            match db.from("studio_snippets").insert({"id": "tpl-create-table", "name": "Create table", "description": "Create a table", "sql": "create table items (id text primary key, name text not null)", "folder": "Templates", "favorite": "false", "visibility": "shared", "updated_at": ts}) {
+                when success _ then {}
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            match db.from("studio_snippets").insert({"id": "tpl-rls", "name": "Enable RLS read", "description": "Select for all users", "sql": "create policy read_all on items for select using (true)", "folder": "Templates", "favorite": "false", "visibility": "shared", "updated_at": ts}) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
         when failure error then match error {
             when Failed(message) then { fail RigError.Database(message) }
         }
@@ -298,6 +413,1656 @@ to resolve_object(root: Text, requested: Text) returns Text or fails RigError {
     return "{root}/{requested}"
 }
 
+# --- Studio (tape-shaped static mount, gated with Basic auth) ----------------
+#
+#   let studio = Studio.new(username: "admin", password: "secret")
+#   # or with an explicit root:
+#   let studio = Studio.new(root: "../../studio/dist", username: "admin", password: "secret")
+#
+#   route get "/studio/{*filepath}" {
+#       match authorize_studio(studio, request.headers) {
+#           when success _ then match resolve_studio(studio, filepath) {
+#               when success target then reply file target
+#               when failure error then reply text explain(error) as "text/plain" status 404
+#           }
+#           when failure _ then reply text "unauthorized" as "text/plain" status 401
+#       }
+#   }
+
+type Studio {
+    root: Text = "studio/dist"
+    username: Text
+    password: Text
+}
+
+type StudioStorage {
+    root: Text
+    entries: [Text]
+}
+
+to studio_root() returns Text {
+    match env.get("RIG_STUDIO_ROOT") {
+        when found root then { return root }
+        when nothing then {}
+    }
+    match File.read("studio/dist/index.html") {
+        when success _ then { return "studio/dist" }
+        when failure _ then {}
+    }
+    match File.read("vendor/rig/studio/dist/index.html") {
+        when success _ then { return "vendor/rig/studio/dist" }
+        when failure _ then {}
+    }
+    match File.read("../../studio/dist/index.html") {
+        when success _ then { return "../../studio/dist" }
+        when failure _ then {}
+    }
+    match env.get("HOME") {
+        when found home then {
+            let candidate = "{home}/.vaab/riffs/rig/studio/dist"
+            match File.read("{candidate}/index.html") {
+                when success _ then { return candidate }
+                when failure _ then {}
+            }
+        }
+        when nothing then {}
+    }
+    return "studio/dist"
+}
+
+to default_studio() returns Studio {
+    let username = env.get("RIG_STUDIO_USER") otherwise "admin"
+    let password = env.get("RIG_STUDIO_PASS") otherwise "secret"
+    return Studio.new(root: studio_root(), username: username, password: password)
+}
+
+to mount_studio(username: Text, password: Text) returns Studio {
+    return Studio.new(root: studio_root(), username: username, password: password)
+}
+
+to mount_studio_at(root: Text, username: Text, password: Text) returns Studio {
+    return Studio.new(root: root, username: username, password: password)
+}
+
+to authorize_studio(studio: Studio, headers: {Text: Text}) returns Int or fails RigError {
+    match headers.get("authorization") {
+        when found value then {
+            if basic_auth_ok(value, studio.username, studio.password) {
+                return 1
+            }
+            fail RigError.Unauthorized
+        }
+        when nothing then match headers.get("Authorization") {
+            when found value then {
+                if basic_auth_ok(value, studio.username, studio.password) {
+                    return 1
+                }
+                fail RigError.Unauthorized
+            }
+            when nothing then { fail RigError.Unauthorized }
+        }
+    }
+}
+
+to resolve_studio(studio: Studio, requested: Text) returns Text or fails RigError {
+    if requested.contains("..") {
+        fail RigError.Unsafe(requested)
+    }
+    # Empty path and client-side routes (no file extension) serve the SPA shell.
+    if requested.is_empty {
+        return "{studio.root}/index.html"
+    }
+    if requested.contains(".") {
+        return "{studio.root}/{requested}"
+    }
+    return "{studio.root}/index.html"
+}
+
+# --- Studio operator API (auth config + row writes) ------------------------
+
+type StudioMeta {
+    auth_secret_set: Bool
+    can_patch: Bool
+    can_insert: Bool
+}
+
+type StudioAuthConfigBody {
+    email_enabled: Bool
+    min_password_length: Text
+    magic_link_enabled: Bool
+    google_enabled: Bool
+    google_client_id: Text
+    google_client_secret: Text
+    google_client_secret_last4: Text
+    github_enabled: Bool
+    github_client_id: Text
+    github_client_secret: Text
+    github_client_secret_last4: Text
+    site_url: Text
+    redirect_urls: Text
+    anonymous_enabled: Bool
+    confirm_email: Bool
+    phone_enabled: Bool
+    custom_oauth_enabled: Bool
+    custom_oauth_name: Text
+    custom_oauth_client_id: Text
+    custom_oauth_client_secret: Text
+    custom_oauth_client_secret_last4: Text
+    custom_oauth_url: Text
+    smtp_host: Text
+    smtp_port: Text
+    smtp_user: Text
+    smtp_pass: Text
+    smtp_admin_email: Text
+    smtp_sender_name: Text
+    rate_limit_email: Text
+    rate_limit_token: Text
+    jwt_expiry: Text
+}
+
+type StudioAuthConfigView {
+    email_enabled: Bool
+    min_password_length: Text
+    magic_link_enabled: Bool
+    google_enabled: Bool
+    google_client_id: Text
+    google_has_secret: Bool
+    google_client_secret_last4: Text
+    github_enabled: Bool
+    github_client_id: Text
+    github_has_secret: Bool
+    github_client_secret_last4: Text
+    site_url: Text
+    redirect_urls: Text
+    anonymous_enabled: Bool
+    confirm_email: Bool
+    phone_enabled: Bool
+    custom_oauth_enabled: Bool
+    custom_oauth_name: Text
+    custom_oauth_client_id: Text
+    custom_oauth_has_secret: Bool
+    custom_oauth_client_secret_last4: Text
+    custom_oauth_url: Text
+    smtp_host: Text
+    smtp_port: Text
+    smtp_user: Text
+    smtp_has_pass: Bool
+    smtp_admin_email: Text
+    smtp_sender_name: Text
+    rate_limit_email: Text
+    rate_limit_token: Text
+    jwt_expiry: Text
+}
+
+type StudioInsertBody {
+    table: Text
+    id: Text
+    title: Text
+    owner: Text
+    email: Text
+    name: Text
+    done: Text
+}
+
+type StudioPatchBody {
+    table: Text
+    id: Text
+    column: Text
+    value: Text
+}
+
+type StudioTableInfo {
+    name: Text
+    kind: Text
+    sql: Text
+    row_count: Text
+    rls_enabled: Text
+    columns: [{Text: Text}]
+    foreign_keys: [{Text: Text}]
+    indexes: [{Text: Text}]
+}
+
+type StudioSqlBody {
+    sql: Text
+}
+
+type StudioDdlBody {
+    action: Text
+    table: Text
+    new_name: Text
+    sql: Text
+    columns: [{Text: Text}]
+}
+
+type StudioRowQuery {
+    table: Text
+    limit: Int
+    offset: Int
+    filters: [{Text: Text}]
+    sorts: [{Text: Text}]
+}
+
+type StudioRowPage {
+    rows: [{Text: Text}]
+    count: Int
+}
+
+type StudioRowWrite {
+    table: Text
+    id: Text
+    values: {Text: Text}
+}
+
+type StudioRowDelete {
+    table: Text
+    ids: [Text]
+}
+
+type StudioSnippetBody {
+    id: Text
+    name: Text
+    description: Text
+    sql: Text
+    folder: Text
+    favorite: Text
+    visibility: Text
+}
+
+type StudioAuthUserBody {
+    id: Text
+    email: Text
+    phone: Text
+    provider: Text
+    raw_user_meta_data: Text
+    banned_until: Text
+    action: Text
+}
+
+type StudioPolicyBody {
+    id: Text
+    schema_name: Text
+    table_name: Text
+    name: Text
+    action: Text
+    roles: Text
+    command: Text
+    definition: Text
+    check_expr: Text
+    rls_enabled: Text
+}
+
+type StudioBucketBody {
+    id: Text
+    name: Text
+    public: Text
+    file_size_limit: Text
+    allowed_mime_types: Text
+}
+
+type StudioObjectBody {
+    id: Text
+    bucket_id: Text
+    name: Text
+    size: Text
+    mime_type: Text
+    content: Text
+}
+
+type StudioObjectDelete {
+    id: Text
+    bucket_id: Text
+    name: Text
+}
+
+type StudioFunctionBody {
+    id: Text
+    slug: Text
+    name: Text
+    status: Text
+    version: Text
+    entrypoint_path: Text
+    verify_jwt: Text
+    code: Text
+    invoke: Text
+    method: Text
+    headers: Text
+    body: Text
+}
+
+type StudioFunctionResult {
+    count: Int
+    invoked: Bool
+    status: Text
+    body: Text
+    duration_ms: Text
+}
+
+type StudioLogQuery {
+    service: Text
+    level: Text
+    sql: Text
+}
+
+type StudioMigrationBody {
+    version: Text
+    name: Text
+    statements: Text
+}
+
+type StudioWebhookBody {
+    id: Text
+    name: Text
+    table_name: Text
+    events: Text
+    url: Text
+    method: Text
+    headers: Text
+    enabled: Text
+}
+
+to studio_meta() returns StudioMeta {
+    match env.get("AUTH_SECRET") {
+        when found _ then {
+            return StudioMeta.new(auth_secret_set: yes, can_patch: yes, can_insert: yes)
+        }
+        when nothing then {
+            return StudioMeta.new(auth_secret_set: no, can_patch: yes, can_insert: yes)
+        }
+    }
+}
+
+to flag_text(value: Bool) returns Text {
+    if value {
+        return "true"
+    }
+    return "false"
+}
+
+to flag_bool(value: Text, fallback: Bool) returns Bool {
+    if value == "true" {
+        return yes
+    }
+    if value == "false" {
+        return no
+    }
+    return fallback
+}
+
+to nonempty(value: Text, fallback: Text) returns Text {
+    if value.is_empty {
+        return fallback
+    }
+    return value
+}
+
+to has_text(value: Text) returns Bool {
+    if value.is_empty {
+        return no
+    }
+    return yes
+}
+
+to config_get(db: Db, key: Text) returns Text or fails RigError {
+    match db.from("studio_config").equals("key", key).first() {
+        when success maybe then match maybe {
+            when found row then match row.get("value") {
+                when found value then { return value }
+                when nothing then { return "" }
+            }
+            when nothing then { return "" }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to config_set(db: Db, key: Text, value: Text) returns Int or fails RigError {
+    match db.from("studio_config").equals("key", key).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("studio_config").equals("key", key).update({"value": value}) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("studio_config").insert({"key": key, "value": value}) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to keep_or_set(db: Db, key: Text, incoming: Text) returns Text or fails RigError {
+    if incoming.is_empty {
+        return try config_get(db, key)
+    }
+    let _count = try config_set(db, key, incoming)
+    return incoming
+}
+
+to auth_view_from_db(db: Db) returns StudioAuthConfigView or fails RigError {
+    let email_raw = try config_get(db, "email_enabled")
+    let magic_raw = try config_get(db, "magic_link_enabled")
+    let google_on = try config_get(db, "google_enabled")
+    let github_on = try config_get(db, "github_enabled")
+    let google_secret = try config_get(db, "google_client_secret")
+    let github_secret = try config_get(db, "github_client_secret")
+    let min_len = try config_get(db, "min_password_length")
+    let google_id = try config_get(db, "google_client_id")
+    let google_last4 = try config_get(db, "google_client_secret_last4")
+    let github_id = try config_get(db, "github_client_id")
+    let github_last4 = try config_get(db, "github_client_secret_last4")
+    let site = try config_get(db, "site_url")
+    let redirects = try config_get(db, "redirect_urls")
+    let anon_raw = try config_get(db, "anonymous_enabled")
+    let confirm_raw = try config_get(db, "confirm_email")
+    let phone_raw = try config_get(db, "phone_enabled")
+    let custom_on = try config_get(db, "custom_oauth_enabled")
+    let custom_name = try config_get(db, "custom_oauth_name")
+    let custom_id = try config_get(db, "custom_oauth_client_id")
+    let custom_secret = try config_get(db, "custom_oauth_client_secret")
+    let custom_last4 = try config_get(db, "custom_oauth_client_secret_last4")
+    let custom_url = try config_get(db, "custom_oauth_url")
+    let smtp_host = try config_get(db, "smtp_host")
+    let smtp_port = try config_get(db, "smtp_port")
+    let smtp_user = try config_get(db, "smtp_user")
+    let smtp_pass = try config_get(db, "smtp_pass")
+    let smtp_admin = try config_get(db, "smtp_admin_email")
+    let smtp_sender = try config_get(db, "smtp_sender_name")
+    let rate_email = try config_get(db, "rate_limit_email")
+    let rate_token = try config_get(db, "rate_limit_token")
+    let jwt_expiry = try config_get(db, "jwt_expiry")
+    return StudioAuthConfigView.new(
+        email_enabled: flag_bool(email_raw, yes),
+        min_password_length: nonempty(min_len, "8"),
+        magic_link_enabled: flag_bool(magic_raw, no),
+        google_enabled: flag_bool(google_on, no),
+        google_client_id: google_id,
+        google_has_secret: has_text(google_secret),
+        google_client_secret_last4: google_last4,
+        github_enabled: flag_bool(github_on, no),
+        github_client_id: github_id,
+        github_has_secret: has_text(github_secret),
+        github_client_secret_last4: github_last4,
+        site_url: site,
+        redirect_urls: redirects,
+        anonymous_enabled: flag_bool(anon_raw, no),
+        confirm_email: flag_bool(confirm_raw, yes),
+        phone_enabled: flag_bool(phone_raw, no),
+        custom_oauth_enabled: flag_bool(custom_on, no),
+        custom_oauth_name: custom_name,
+        custom_oauth_client_id: custom_id,
+        custom_oauth_has_secret: has_text(custom_secret),
+        custom_oauth_client_secret_last4: custom_last4,
+        custom_oauth_url: custom_url,
+        smtp_host: smtp_host,
+        smtp_port: nonempty(smtp_port, "587"),
+        smtp_user: smtp_user,
+        smtp_has_pass: has_text(smtp_pass),
+        smtp_admin_email: smtp_admin,
+        smtp_sender_name: smtp_sender,
+        rate_limit_email: nonempty(rate_email, "30"),
+        rate_limit_token: nonempty(rate_token, "30"),
+        jwt_expiry: nonempty(jwt_expiry, "3600"),
+    )
+}
+
+to get_auth_config(db: Db) returns StudioAuthConfigView or fails RigError {
+    return try auth_view_from_db(db)
+}
+
+to put_auth_config(db: Db, incoming: StudioAuthConfigBody) returns StudioAuthConfigView or fails RigError {
+    let _e = try config_set(db, "email_enabled", flag_text(incoming.email_enabled))
+    let _m = try config_set(db, "min_password_length", incoming.min_password_length)
+    let _ml = try config_set(db, "magic_link_enabled", flag_text(incoming.magic_link_enabled))
+    let _ge = try config_set(db, "google_enabled", flag_text(incoming.google_enabled))
+    let _gi = try config_set(db, "google_client_id", incoming.google_client_id)
+    let _gs = try keep_or_set(db, "google_client_secret", incoming.google_client_secret)
+    if not incoming.google_client_secret.is_empty {
+        let _g4 = try config_set(db, "google_client_secret_last4", incoming.google_client_secret_last4)
+    }
+    let _he = try config_set(db, "github_enabled", flag_text(incoming.github_enabled))
+    let _hi = try config_set(db, "github_client_id", incoming.github_client_id)
+    let _hs = try keep_or_set(db, "github_client_secret", incoming.github_client_secret)
+    if not incoming.github_client_secret.is_empty {
+        let _h4 = try config_set(db, "github_client_secret_last4", incoming.github_client_secret_last4)
+    }
+    let _su = try config_set(db, "site_url", incoming.site_url)
+    let _ru = try config_set(db, "redirect_urls", incoming.redirect_urls)
+    let _an = try config_set(db, "anonymous_enabled", flag_text(incoming.anonymous_enabled))
+    let _ce = try config_set(db, "confirm_email", flag_text(incoming.confirm_email))
+    let _ph = try config_set(db, "phone_enabled", flag_text(incoming.phone_enabled))
+    let _co = try config_set(db, "custom_oauth_enabled", flag_text(incoming.custom_oauth_enabled))
+    let _cn = try config_set(db, "custom_oauth_name", incoming.custom_oauth_name)
+    let _ci = try config_set(db, "custom_oauth_client_id", incoming.custom_oauth_client_id)
+    let _cs = try keep_or_set(db, "custom_oauth_client_secret", incoming.custom_oauth_client_secret)
+    if not incoming.custom_oauth_client_secret.is_empty {
+        let _c4 = try config_set(db, "custom_oauth_client_secret_last4", incoming.custom_oauth_client_secret_last4)
+    }
+    let _cu = try config_set(db, "custom_oauth_url", incoming.custom_oauth_url)
+    let _sh = try config_set(db, "smtp_host", incoming.smtp_host)
+    let _sp = try config_set(db, "smtp_port", incoming.smtp_port)
+    let _sm = try config_set(db, "smtp_user", incoming.smtp_user)
+    let _ss = try keep_or_set(db, "smtp_pass", incoming.smtp_pass)
+    let _sa = try config_set(db, "smtp_admin_email", incoming.smtp_admin_email)
+    let _sn = try config_set(db, "smtp_sender_name", incoming.smtp_sender_name)
+    let _re = try config_set(db, "rate_limit_email", incoming.rate_limit_email)
+    let _rt = try config_set(db, "rate_limit_token", incoming.rate_limit_token)
+    let _jw = try config_set(db, "jwt_expiry", incoming.jwt_expiry)
+    return try auth_view_from_db(db)
+}
+
+to insert_studio_row(db: Db, body: StudioInsertBody) returns Int or fails RigError {
+    let allowed = try allow_table(body.table)
+    if allowed == "todos" {
+        let row_id = nonempty(body.id, "{body.title}-{now()}")
+        let owner_id = nonempty(body.owner, "studio")
+        let done_val = nonempty(body.done, "false")
+        match db.from("todos").insert({"id": row_id, "title": body.title, "owner": owner_id, "done": done_val}) {
+            when success count then { return count }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    if allowed == "profiles" {
+        let row_id = nonempty(body.id, body.email)
+        if row_id.is_empty {
+            fail RigError.BadRequest("id or email required")
+        }
+        match db.from("profiles").insert({"id": row_id, "email": body.email, "name": body.name}) {
+            when success count then { return count }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    fail RigError.Forbidden(body.table)
+}
+
+to patch_studio_row(db: Db, body: StudioPatchBody) returns Int or fails RigError {
+    let allowed = try allow_table(body.table)
+    if body.id.is_empty {
+        fail RigError.BadRequest("id required")
+    }
+    if body.column == "title" {
+        match db.from(allowed).equals("id", body.id).update({"title": body.value}) {
+            when success count then {
+                if count == 0 { fail RigError.NotFound(body.id) }
+                return count
+            }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    if body.column == "owner" {
+        match db.from(allowed).equals("id", body.id).update({"owner": body.value}) {
+            when success count then {
+                if count == 0 { fail RigError.NotFound(body.id) }
+                return count
+            }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    if body.column == "done" {
+        match db.from(allowed).equals("id", body.id).update({"done": body.value}) {
+            when success count then {
+                if count == 0 { fail RigError.NotFound(body.id) }
+                return count
+            }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    if body.column == "email" {
+        match db.from(allowed).equals("id", body.id).update({"email": body.value}) {
+            when success count then {
+                if count == 0 { fail RigError.NotFound(body.id) }
+                return count
+            }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    if body.column == "name" {
+        match db.from(allowed).equals("id", body.id).update({"name": body.value}) {
+            when success count then {
+                if count == 0 { fail RigError.NotFound(body.id) }
+                return count
+            }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    fail RigError.BadRequest("unknown column")
+}
+
+# --- Studio operator API (introspection, SQL, generic rows, extras) ----------
+
+to table_count(db: Db, name: Text) returns Text {
+    match db.from(name).count() {
+        when success n then { return "{n}" }
+        when failure _ then { return "0" }
+    }
+}
+
+to rls_flag(db: Db, table_name: Text) returns Text {
+    match config_get(db, "rls:{table_name}") {
+        when success value then { return nonempty(value, "false") }
+        when failure _ then { return "false" }
+    }
+}
+
+to describe_table(db: Db, row: {Text: Text}) returns StudioTableInfo {
+    let name = row_text(row, "name")
+    let kind = nonempty(row_text(row, "type"), "table")
+    let sql = row_text(row, "sql")
+    if not ident_ok(name) {
+        return StudioTableInfo.new(
+            name: name,
+            kind: kind,
+            sql: sql,
+            row_count: "0",
+            rls_enabled: "false",
+            columns: empty_rows(),
+            foreign_keys: empty_rows(),
+            indexes: empty_rows(),
+        )
+    }
+    return StudioTableInfo.new(
+        name: name,
+        kind: kind,
+        sql: sql,
+        row_count: table_count(db, name),
+        rls_enabled: rls_flag(db, name),
+        columns: pragma_rows(db, "PRAGMA table_info({name})"),
+        foreign_keys: pragma_rows(db, "PRAGMA foreign_key_list({name})"),
+        indexes: pragma_rows(db, "PRAGMA index_list({name})"),
+    )
+}
+
+to list_studio_tables(db: Db) returns [StudioTableInfo] or fails RigError {
+    let rows = try query_sql(db, "select name, type, sql from sqlite_master where type in ('table', 'view') and name not like 'sqlite_%' order by name")
+    return rows.map(row -> describe_table(db, row))
+}
+
+to log_studio(db: Db, service: Text, level: Text, method: Text, path: Text, msg: Text, status_code: Text, duration_ms: Text) returns Int {
+    let id = "{service}-{now()}-{msg.length}"
+    match db.from("studio_logs").insert({
+        "id": id,
+        "ts": "{now()}",
+        "service": service,
+        "level": level,
+        "status_code": status_code,
+        "method": method,
+        "path": path,
+        "msg": msg,
+        "duration_ms": duration_ms,
+    }) {
+        when success count then { return count }
+        when failure _ then { return 0 }
+    }
+}
+
+to sql_safe(sql: Text) returns Text or fails RigError {
+    if sql.is_empty {
+        fail RigError.BadRequest("empty sql")
+    }
+    let lowered = sql.lower()
+    if lowered.contains(";") {
+        fail RigError.BadRequest("single statement only")
+    }
+    if lowered.contains("attach") {
+        fail RigError.Unsafe(sql)
+    }
+    if lowered.contains("detach") {
+        fail RigError.Unsafe(sql)
+    }
+    if lowered.contains("readfile") {
+        fail RigError.Unsafe(sql)
+    }
+    if lowered.contains("writefile") {
+        fail RigError.Unsafe(sql)
+    }
+    if lowered.contains("load_extension") {
+        fail RigError.Unsafe(sql)
+    }
+    if lowered.contains("sqlite_dbpage") {
+        fail RigError.Unsafe(sql)
+    }
+    if lowered.contains("file:") {
+        fail RigError.Unsafe(sql)
+    }
+    return sql
+}
+
+to looks_like_read(sql: Text) returns Bool {
+    let lowered = sql.lower()
+    if lowered.contains("insert into") { return no }
+    if lowered.contains("delete from") { return no }
+    if lowered.contains("update ") { return no }
+    if lowered.contains("create table") { return no }
+    if lowered.contains("create index") { return no }
+    if lowered.contains("create view") { return no }
+    if lowered.contains("create trigger") { return no }
+    if lowered.contains("create unique") { return no }
+    if lowered.contains("alter table") { return no }
+    if lowered.contains("drop table") { return no }
+    if lowered.contains("drop index") { return no }
+    if lowered.contains("drop view") { return no }
+    if lowered.contains("explain") { return yes }
+    if lowered.contains("pragma") { return yes }
+    if lowered.contains("select") { return yes }
+    if lowered.contains("with ") { return yes }
+    return no
+}
+
+to run_studio_sql(db: Db, sql: Text) returns [{Text: Text}] or fails RigError {
+    let safe = try sql_safe(sql)
+    let _log = log_studio(db, "postgres", "info", "POST", "/studio-api/sql", safe, "200", "0")
+    let empty: [Text] = []
+    if looks_like_read(safe) {
+        match db.query(safe, empty) {
+            when success rows then { return rows }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    match db.execute(safe, empty) {
+        when success count then { return [{"count": "{count}"}] }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to type_ok(kind: Text) returns Bool {
+    if ident_ok(kind) { return yes }
+    if kind == "double precision" { return yes }
+    if kind == "timestamp with time zone" { return yes }
+    return no
+}
+
+to default_ok(value: Text) returns Bool {
+    if value.is_empty { return yes }
+    if value.contains(";") { return no }
+    if value.contains("--") { return no }
+    return yes
+}
+
+to column_sql(col: {Text: Text}) returns Text or fails RigError {
+    let name = try ident(row_text(col, "name"))
+    let kind = nonempty(row_text(col, "type"), "text")
+    if not type_ok(kind) {
+        fail RigError.BadRequest("bad column type")
+    }
+    let changing sql = "{name} {kind}"
+    if row_text(col, "pk") == "true" {
+        sql = "{sql} primary key"
+    }
+    if row_text(col, "nullable") == "false" {
+        sql = "{sql} not null"
+    }
+    let dflt = row_text(col, "default")
+    if not dflt.is_empty {
+        if not default_ok(dflt) {
+            fail RigError.BadRequest("bad column default")
+        }
+        sql = "{sql} default {dflt}"
+    }
+    let refs = row_text(col, "references")
+    if not refs.is_empty {
+        if refs.contains(";") {
+            fail RigError.BadRequest("bad references")
+        }
+        sql = "{sql} references {refs}"
+    }
+    return sql
+}
+
+to columns_sql(cols: [{Text: Text}], i: Int) returns Text or fails RigError {
+    if i >= cols.count { return "" }
+    let piece = try column_sql(cols[i])
+    let rest = try columns_sql(cols, i + 1)
+    if rest.is_empty { return piece }
+    return "{piece}, {rest}"
+}
+
+to run_studio_ddl(db: Db, body: StudioDdlBody) returns [{Text: Text}] or fails RigError {
+    let table = try ident(body.table)
+    if is_sqlite_name(table) {
+        fail RigError.Forbidden(table)
+    }
+    if body.action == "create" {
+        let cols = try columns_sql(body.columns, 0)
+        if cols.is_empty {
+            fail RigError.BadRequest("columns required")
+        }
+        let _n = try exec_sql(db, "create table {table} ({cols})")
+        let _l = log_studio(db, "postgres", "info", "POST", "/studio-api/tables/ddl", "create {table}", "200", "0")
+        return [{"count": "1", "table": table}]
+    }
+    if body.action == "drop" {
+        let _n = try exec_sql(db, "drop table if exists {table}")
+        let _l = log_studio(db, "postgres", "info", "POST", "/studio-api/tables/ddl", "drop {table}", "200", "0")
+        return [{"count": "1", "table": table}]
+    }
+    if body.action == "truncate" {
+        let _n = try exec_sql(db, "delete from {table}")
+        let _l = log_studio(db, "postgres", "info", "POST", "/studio-api/tables/ddl", "truncate {table}", "200", "0")
+        return [{"count": "1", "table": table}]
+    }
+    if body.action == "duplicate" {
+        let dest = try ident(body.new_name)
+        let _n = try exec_sql(db, "create table {dest} as select * from {table}")
+        let _l = log_studio(db, "postgres", "info", "POST", "/studio-api/tables/ddl", "duplicate {table}", "200", "0")
+        return [{"count": "1", "table": dest}]
+    }
+    if body.action == "add_column" {
+        if body.columns.is_empty {
+            fail RigError.BadRequest("columns required")
+        }
+        let col = try column_sql(body.columns[0])
+        let _n = try exec_sql(db, "alter table {table} add column {col}")
+        return [{"count": "1", "table": table}]
+    }
+    if body.action == "rename_column" {
+        if body.columns.is_empty {
+            fail RigError.BadRequest("columns required")
+        }
+        let from_name = try ident(row_text(body.columns[0], "name"))
+        let to_name = try ident(body.new_name)
+        let _n = try exec_sql(db, "alter table {table} rename column {from_name} to {to_name}")
+        return [{"count": "1", "table": table}]
+    }
+    if body.action == "drop_column" {
+        if not body.new_name.is_empty {
+            let col = try ident(body.new_name)
+            let _d = try exec_sql(db, "alter table {table} drop column {col}")
+            return [{"count": "1", "table": table}]
+        }
+        if body.columns.is_empty {
+            fail RigError.BadRequest("column name required")
+        }
+        let named = try ident(row_text(body.columns[0], "name"))
+        let _n = try exec_sql(db, "alter table {table} drop column {named}")
+        return [{"count": "1", "table": table}]
+    }
+    if body.action == "rename" {
+        let dest = try ident(body.new_name)
+        let _n = try exec_sql(db, "alter table {table} rename to {dest}")
+        return [{"count": "1", "table": dest}]
+    }
+    if not body.sql.is_empty {
+        return try run_studio_sql(db, body.sql)
+    }
+    fail RigError.BadRequest("unknown ddl action")
+}
+
+to pk_from_cols(cols: [{Text: Text}], i: Int) returns Text {
+    if i >= cols.count { return "id" }
+    let col = cols[i]
+    if row_text(col, "pk") == "1" {
+        return nonempty(row_text(col, "name"), "id")
+    }
+    return pk_from_cols(cols, i + 1)
+}
+
+to primary_key(db: Db, table: Text) returns Text {
+    if not ident_ok(table) { return "id" }
+    return pk_from_cols(pragma_rows(db, "PRAGMA table_info({table})"), 0)
+}
+
+to apply_filter(q: Query, filter: {Text: Text}) returns Query {
+    let col = row_text(filter, "column")
+    if not ident_ok(col) { return q }
+    let op = nonempty(row_text(filter, "op"), "=")
+    let val = row_text(filter, "value")
+    if op == "!=" { return q.differs(col, val) }
+    if op == ">" { return q.above(col, val) }
+    if op == ">=" { return q.at_least(col, val) }
+    if op == "<" { return q.below(col, val) }
+    if op == "<=" { return q.at_most(col, val) }
+    if op == "LIKE" { return q.like(col, val) }
+    if op == "like" { return q.like(col, val) }
+    if op == "IS NULL" { return q.equals(col, "") }
+    if op == "IS NOT NULL" { return q.differs(col, "") }
+    return q.equals(col, val)
+}
+
+to apply_filters(q: Query, filters: [{Text: Text}], i: Int) returns Query {
+    if i >= filters.count { return q }
+    return apply_filters(apply_filter(q, filters[i]), filters, i + 1)
+}
+
+to apply_sort(q: Query, sort: {Text: Text}) returns Query {
+    let col = row_text(sort, "column")
+    if not ident_ok(col) { return q }
+    let dir = row_text(sort, "dir").lower()
+    if dir == "asc" { return q.order(col) }
+    return q.order_desc(col)
+}
+
+to apply_sorts(q: Query, sorts: [{Text: Text}], i: Int) returns Query {
+    if i >= sorts.count { return q }
+    return apply_sorts(apply_sort(q, sorts[i]), sorts, i + 1)
+}
+
+to clamp_limit(n: Int) returns Int {
+    if n <= 0 { return 100 }
+    if n > 1000 { return 1000 }
+    return n
+}
+
+to query_studio_rows(db: Db, body: StudioRowQuery) returns StudioRowPage or fails RigError {
+    let table = try allow_user_table(body.table)
+    let filtered = apply_filters(db.from(table), body.filters, 0)
+    match filtered.count() {
+        when success total then {
+            let sorted = apply_sorts(filtered, body.sorts, 0)
+            let pk = primary_key(db, table)
+            let ordered = if body.sorts.is_empty { sorted.order_desc(pk) } else { sorted }
+            match ordered.limit(clamp_limit(body.limit)).offset(body.offset.max(0)).all() {
+                when success rows then { return StudioRowPage.new(rows: rows, count: total) }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to insert_studio_values(db: Db, body: StudioRowWrite) returns Int or fails RigError {
+    let table = try allow_user_table(body.table)
+    if body.values.is_empty {
+        fail RigError.BadRequest("values required")
+    }
+    if not values_ok(body.values) {
+        fail RigError.BadRequest("bad column name")
+    }
+    match db.from(table).insert(body.values) {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to patch_studio_values(db: Db, body: StudioRowWrite) returns Int or fails RigError {
+    let table = try allow_user_table(body.table)
+    if body.id.is_empty {
+        fail RigError.BadRequest("id required")
+    }
+    if body.values.is_empty {
+        fail RigError.BadRequest("values required")
+    }
+    if not values_ok(body.values) {
+        fail RigError.BadRequest("bad column name")
+    }
+    let pk = primary_key(db, table)
+    match db.from(table).equals(pk, body.id).update(body.values) {
+        when success count then {
+            if count == 0 { fail RigError.NotFound(body.id) }
+            return count
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to delete_one_id(db: Db, table: Text, pk: Text, id: Text) returns Int or fails RigError {
+    match db.from(table).equals(pk, id).delete() {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to delete_studio_ids_at(db: Db, table: Text, pk: Text, ids: [Text], i: Int) returns Int or fails RigError {
+    if i >= ids.count { return 0 }
+    let n = try delete_one_id(db, table, pk, ids[i])
+    return n + try delete_studio_ids_at(db, table, pk, ids, i + 1)
+}
+
+to delete_studio_ids(db: Db, body: StudioRowDelete) returns Int or fails RigError {
+    let table = try allow_user_table(body.table)
+    let pk = primary_key(db, table)
+    return try delete_studio_ids_at(db, table, pk, body.ids, 0)
+}
+
+to list_snippets(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("studio_snippets").order_desc("updated_at").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to save_snippet(db: Db, body: StudioSnippetBody) returns Int or fails RigError {
+    let id = nonempty(body.id, "snip-{now()}")
+    match db.from("studio_snippets").equals("id", id).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("studio_snippets").equals("id", id).update({
+                "name": body.name,
+                "description": body.description,
+                "sql": body.sql,
+                "folder": nonempty(body.folder, "Private"),
+                "favorite": nonempty(body.favorite, "false"),
+                "visibility": nonempty(body.visibility, "private"),
+                "updated_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("studio_snippets").insert({
+                "id": id,
+                "name": body.name,
+                "description": body.description,
+                "sql": body.sql,
+                "folder": nonempty(body.folder, "Private"),
+                "favorite": nonempty(body.favorite, "false"),
+                "visibility": nonempty(body.visibility, "private"),
+                "updated_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to delete_snippet(db: Db, body: StudioSnippetBody) returns Int or fails RigError {
+    if body.id.is_empty {
+        fail RigError.BadRequest("id required")
+    }
+    match db.from("studio_snippets").equals("id", body.id).delete() {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to list_auth_users(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("auth_users").order_desc("created_at").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to save_auth_user(db: Db, body: StudioAuthUserBody) returns Int or fails RigError {
+    let id = nonempty(body.id, nonempty(body.email, "user-{now()}"))
+    if id.is_empty {
+        fail RigError.BadRequest("id or email required")
+    }
+    if body.action == "ban" {
+        match db.from("auth_users").equals("id", id).update({"banned_until": nonempty(body.banned_until, "{now()}")}) {
+            when success count then { return count }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    if body.action == "unban" {
+        match db.from("auth_users").equals("id", id).update({"banned_until": ""}) {
+            when success count then { return count }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    match db.from("auth_users").equals("id", id).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("auth_users").equals("id", id).update({
+                "email": body.email,
+                "phone": body.phone,
+                "provider": nonempty(body.provider, "email"),
+                "raw_user_meta_data": nonempty(body.raw_user_meta_data, ""),
+                "banned_until": body.banned_until,
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then {
+                match db.from("auth_users").insert({
+                    "id": id,
+                    "email": body.email,
+                    "phone": body.phone,
+                    "provider": nonempty(body.provider, "email"),
+                    "created_at": "{now()}",
+                    "last_sign_in_at": "",
+                    "raw_user_meta_data": nonempty(body.raw_user_meta_data, ""),
+                    "banned_until": body.banned_until,
+                }) {
+                    when success count then {
+                        match db.from("profiles").equals("id", id).first() {
+                            when success existing then match existing {
+                                when found _ then { return count }
+                                when nothing then match db.from("profiles").insert({"id": id, "email": body.email, "name": ""}) {
+                                    when success _ then { return count }
+                                    when failure _ then { return count }
+                                }
+                            }
+                            when failure _ then { return count }
+                        }
+                    }
+                    when failure error then match error {
+                        when Failed(message) then { fail RigError.Database(message) }
+                    }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to delete_auth_user(db: Db, body: StudioAuthUserBody) returns Int or fails RigError {
+    if body.id.is_empty {
+        fail RigError.BadRequest("id required")
+    }
+    match db.from("profiles").equals("id", body.id).delete() {
+        when success _ then {}
+        when failure _ then {}
+    }
+    match db.from("auth_users").equals("id", body.id).delete() {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to list_policies(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("studio_policies").order_desc("id").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to save_policy(db: Db, body: StudioPolicyBody) returns Int or fails RigError {
+    if not body.table_name.is_empty {
+        let _r = try config_set(db, "rls:{body.table_name}", nonempty(body.rls_enabled, "true"))
+    }
+    if body.name.is_empty {
+        return 1
+    }
+    let id = nonempty(body.id, "pol-{body.table_name}-{now()}")
+    match db.from("studio_policies").equals("id", id).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("studio_policies").equals("id", id).update({
+                "schema_name": nonempty(body.schema_name, "public"),
+                "table_name": body.table_name,
+                "name": body.name,
+                "action": nonempty(body.action, "PERMISSIVE"),
+                "roles": nonempty(body.roles, "public"),
+                "command": body.command,
+                "definition": nonempty(body.definition, "true"),
+                "check_expr": body.check_expr,
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("studio_policies").insert({
+                "id": id,
+                "schema_name": nonempty(body.schema_name, "public"),
+                "table_name": body.table_name,
+                "name": body.name,
+                "action": nonempty(body.action, "PERMISSIVE"),
+                "roles": nonempty(body.roles, "public"),
+                "command": body.command,
+                "definition": nonempty(body.definition, "true"),
+                "check_expr": body.check_expr,
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to delete_policy(db: Db, body: StudioPolicyBody) returns Int or fails RigError {
+    if body.id.is_empty {
+        fail RigError.BadRequest("id required")
+    }
+    match db.from("studio_policies").equals("id", body.id).delete() {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to list_buckets(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("studio_buckets").order_desc("created_at").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to save_bucket(db: Db, body: StudioBucketBody) returns Int or fails RigError {
+    let id = nonempty(body.id, nonempty(body.name, "bucket-{now()}"))
+    if id.is_empty {
+        fail RigError.BadRequest("name required")
+    }
+    match db.from("studio_buckets").equals("id", id).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("studio_buckets").equals("id", id).update({
+                "name": nonempty(body.name, id),
+                "public": nonempty(body.public, "false"),
+                "file_size_limit": body.file_size_limit,
+                "allowed_mime_types": body.allowed_mime_types,
+                "updated_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("studio_buckets").insert({
+                "id": id,
+                "name": nonempty(body.name, id),
+                "public": nonempty(body.public, "false"),
+                "file_size_limit": body.file_size_limit,
+                "allowed_mime_types": body.allowed_mime_types,
+                "created_at": "{now()}",
+                "updated_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to list_objects(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("studio_objects").order_desc("created_at").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to save_object(db: Db, body: StudioObjectBody) returns Int or fails RigError {
+    if body.bucket_id.is_empty {
+        fail RigError.BadRequest("bucket_id required")
+    }
+    if body.name.is_empty {
+        fail RigError.BadRequest("name required")
+    }
+    let id = nonempty(body.id, "{body.bucket_id}-{body.name}-{now()}")
+    match db.from("studio_objects").equals("id", id).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("studio_objects").equals("id", id).update({
+                "bucket_id": body.bucket_id,
+                "name": body.name,
+                "size": nonempty(body.size, "0"),
+                "mime_type": body.mime_type,
+                "content": body.content,
+                "updated_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("studio_objects").insert({
+                "id": id,
+                "bucket_id": body.bucket_id,
+                "name": body.name,
+                "size": nonempty(body.size, "0"),
+                "mime_type": body.mime_type,
+                "content": body.content,
+                "created_at": "{now()}",
+                "updated_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to delete_object(db: Db, body: StudioObjectDelete) returns Int or fails RigError {
+    if not body.id.is_empty {
+        match db.from("studio_objects").equals("id", body.id).delete() {
+            when success count then { return count }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
+    }
+    if not body.bucket_id.is_empty {
+        if not body.name.is_empty {
+            match db.from("studio_objects").equals("bucket_id", body.bucket_id).equals("name", body.name).delete() {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+    }
+    fail RigError.BadRequest("id or bucket_id+name required")
+}
+
+to list_functions(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("studio_functions").order_desc("updated_at").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to save_function(db: Db, body: StudioFunctionBody) returns StudioFunctionResult or fails RigError {
+    if body.invoke == "true" {
+        let started = now()
+        let _l = log_studio(db, "edge-functions", "info", nonempty(body.method, "POST"), "/functions/v1/{body.slug}", body.body, "200", "1")
+        let elapsed = now() - started
+        return StudioFunctionResult.new(count: 0, invoked: yes, status: "200", body: "ok {body.slug}", duration_ms: "{elapsed}")
+    }
+    let id = nonempty(body.id, nonempty(body.slug, "fn-{now()}"))
+    match db.from("studio_functions").equals("id", id).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("studio_functions").equals("id", id).update({
+                "slug": nonempty(body.slug, id),
+                "name": nonempty(body.name, body.slug),
+                "status": nonempty(body.status, "active"),
+                "version": nonempty(body.version, "1"),
+                "entrypoint_path": nonempty(body.entrypoint_path, "index.ts"),
+                "verify_jwt": nonempty(body.verify_jwt, "true"),
+                "code": body.code,
+                "updated_at": "{now()}",
+            }) {
+                when success count then {
+                    return StudioFunctionResult.new(count: count, invoked: no, status: "", body: "", duration_ms: "0")
+                }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("studio_functions").insert({
+                "id": id,
+                "slug": nonempty(body.slug, id),
+                "name": nonempty(body.name, body.slug),
+                "status": nonempty(body.status, "active"),
+                "version": nonempty(body.version, "1"),
+                "entrypoint_path": nonempty(body.entrypoint_path, "index.ts"),
+                "verify_jwt": nonempty(body.verify_jwt, "true"),
+                "code": body.code,
+                "created_at": "{now()}",
+                "updated_at": "{now()}",
+            }) {
+                when success count then {
+                    return StudioFunctionResult.new(count: count, invoked: no, status: "", body: "", duration_ms: "0")
+                }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to list_studio_logs(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("studio_logs").order_desc("ts").limit(200).all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to query_studio_logs(db: Db, body: StudioLogQuery) returns [{Text: Text}] or fails RigError {
+    if not body.sql.is_empty {
+        return try run_studio_sql(db, body.sql)
+    }
+    let changing q = db.from("studio_logs")
+    if not body.service.is_empty {
+        q = q.equals("service", body.service)
+    }
+    if not body.level.is_empty {
+        q = q.equals("level", body.level)
+    }
+    match q.order_desc("ts").limit(200).all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to has_pk(cols: [{Text: Text}], i: Int) returns Bool {
+    if i >= cols.count { return no }
+    if row_text(cols[i], "pk") == "1" { return yes }
+    return has_pk(cols, i + 1)
+}
+
+to has_policy(db: Db, table_name: Text) returns Bool {
+    match db.from("studio_policies").equals("table_name", table_name).count() {
+        when success n then {
+            if n > 0 { return yes }
+            return no
+        }
+        when failure _ then { return no }
+    }
+}
+
+to index_has_column(db: Db, index_name: Text, column: Text) returns Bool {
+    if not ident_ok(index_name) { return no }
+    let info = pragma_rows(db, "PRAGMA index_info({index_name})")
+    return rows_have_name(info, column, 0)
+}
+
+to rows_have_name(rows: [{Text: Text}], name: Text, i: Int) returns Bool {
+    if i >= rows.count { return no }
+    if row_text(rows[i], "name") == name { return yes }
+    return rows_have_name(rows, name, i + 1)
+}
+
+to indexes_cover(db: Db, indexes: [{Text: Text}], column: Text, i: Int) returns Bool {
+    if i >= indexes.count { return no }
+    if index_has_column(db, row_text(indexes[i], "name"), column) { return yes }
+    return indexes_cover(db, indexes, column, i + 1)
+}
+
+to write_fk_lints(db: Db, table_name: Text, fks: [{Text: Text}], indexes: [{Text: Text}], i: Int) {
+    if i >= fks.count { return }
+    let col = row_text(fks[i], "from")
+    if not col.is_empty {
+        if not indexes_cover(db, indexes, col, 0) {
+            let _n = log_studio(db, "advisor", "WARN", "GET", "/studio-api/advisors", "unindexed foreign key {table_name}.{col}", "", "0")
+        }
+    }
+    write_fk_lints(db, table_name, fks, indexes, i + 1)
+}
+
+to write_table_lints(db: Db, row: {Text: Text}) {
+    let name = row_text(row, "name")
+    if not ident_ok(name) { return }
+    if is_sqlite_name(name) { return }
+    let kind = row_text(row, "type")
+    if kind == "view" {
+        let _v = log_studio(db, "advisor", "INFO", "GET", "/studio-api/advisors", "exposed view {name}", "", "0")
+        return
+    }
+    let columns = pragma_rows(db, "PRAGMA table_info({name})")
+    if not has_pk(columns, 0) {
+        let _p = log_studio(db, "advisor", "ERROR", "GET", "/studio-api/advisors", "table missing primary key {name}", "", "0")
+    }
+    if not has_policy(db, name) {
+        if rls_flag(db, name) == "false" {
+            let _r = log_studio(db, "advisor", "WARN", "GET", "/studio-api/advisors", "table without RLS policies {name}", "", "0")
+        }
+    }
+    write_fk_lints(db, name, pragma_rows(db, "PRAGMA foreign_key_list({name})"), pragma_rows(db, "PRAGMA index_list({name})"), 0)
+}
+
+to list_advisors(db: Db) returns [{Text: Text}] or fails RigError {
+    let _c = try exec_sql(db, "delete from studio_logs where service = 'advisor'")
+    let tables = try query_sql(db, "select name, type, sql from sqlite_master where type in ('table', 'view') and name not like 'sqlite_%'")
+    tables.each(row -> write_table_lints(db, row))
+    match db.from("studio_logs").equals("service", "advisor").order_desc("id").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to list_migrations(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("studio_migrations").order_desc("applied_at").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to save_migration(db: Db, body: StudioMigrationBody) returns Int or fails RigError {
+    if body.version.is_empty {
+        fail RigError.BadRequest("version required")
+    }
+    if not body.statements.is_empty {
+        let _n = try run_studio_sql(db, body.statements)
+    }
+    match db.from("studio_migrations").equals("version", body.version).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("studio_migrations").equals("version", body.version).update({
+                "name": body.name,
+                "statements": body.statements,
+                "applied_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("studio_migrations").insert({
+                "version": body.version,
+                "name": body.name,
+                "statements": body.statements,
+                "applied_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to list_webhooks(db: Db) returns [{Text: Text}] or fails RigError {
+    match db.from("studio_webhooks").order_desc("created_at").all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to save_webhook(db: Db, body: StudioWebhookBody) returns Int or fails RigError {
+    let id = nonempty(body.id, "hook-{now()}")
+    match db.from("studio_webhooks").equals("id", id).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("studio_webhooks").equals("id", id).update({
+                "name": body.name,
+                "table_name": body.table_name,
+                "events": body.events,
+                "url": body.url,
+                "method": nonempty(body.method, "POST"),
+                "headers": body.headers,
+                "enabled": nonempty(body.enabled, "true"),
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("studio_webhooks").insert({
+                "id": id,
+                "name": body.name,
+                "table_name": body.table_name,
+                "events": body.events,
+                "url": body.url,
+                "method": nonempty(body.method, "POST"),
+                "headers": body.headers,
+                "enabled": nonempty(body.enabled, "true"),
+                "created_at": "{now()}",
+            }) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
 # --- health ----------------------------------------------------------------
 
 to health() returns Health {
@@ -306,4 +2071,906 @@ to health() returns Health {
 
 to auth_health() returns Health {
     return Health.new(name: "rig-auth", ok: yes, version: "0.1.0")
+}
+
+to explain(error: RigError) returns Text {
+    match error {
+        when Missing(name) then { return "missing {name}" }
+        when Database(message) then { return message }
+        when Unauthorized then { return "unauthorized" }
+        when BadRequest(message) then { return message }
+        when NotFound(resource) then { return "not found: {resource}" }
+        when Forbidden(table) then { return "forbidden {table}" }
+        when Unsafe(requested) then { return "unsafe {requested}" }
+    }
+}
+
+# --- Mounted HTTP route groups (`mount rig_studio`, `mount rig_api`, etc.) --
+
+cast RigRoutes {
+    factory client() returns Client or fails RigError {
+        let url = env.get("RIG_DATABASE_URL") otherwise "sqlite:rig.db"
+        let root = env.get("RIG_STORAGE_ROOT") otherwise "rig-storage"
+        return connect_with(url, root)
+    }
+
+    factory db() returns Db or fails RigError {
+        let client = try RigRoutes.client()
+        return open_db(client)
+    }
+
+    factory list_todos() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return list(db, "todos")
+    }
+
+    factory list_profiles() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return list(db, "profiles")
+    }
+
+    factory user(who: User or fails AuthError) returns UserView or fails RigError {
+        let user = try require_user(who)
+        return user_view(user)
+    }
+
+    factory create_todo(who: User or fails AuthError, body: NewTodo) returns OkCount or fails RigError {
+        let user = try require_user(who)
+        let db = try RigRoutes.db()
+        let id = "{user.id}-{body.title}"
+        let count = try insert_todo(db, id, body.title, user.id)
+        return OkCount.new(count: count)
+    }
+
+    factory storage_file(filepath: Text) returns Text or fails RigError {
+        let client = try RigRoutes.client()
+        return try resolve_object(client.storage_root, filepath)
+    }
+
+    factory storage_listing() returns StudioStorage or fails RigError {
+        let client = try RigRoutes.client()
+        let empty: [Text] = []
+        return StudioStorage.new(root: client.storage_root, entries: empty)
+    }
+
+    factory auth_config() returns StudioAuthConfigView or fails RigError {
+        let db = try RigRoutes.db()
+        return try get_auth_config(db)
+    }
+
+    factory save_auth_config(body: StudioAuthConfigBody) returns StudioAuthConfigView or fails RigError {
+        let db = try RigRoutes.db()
+        return try put_auth_config(db, body)
+    }
+
+    factory studio_insert(body: StudioInsertBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try insert_studio_row(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory studio_patch(body: StudioPatchBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try patch_studio_row(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory studio_tables() returns [StudioTableInfo] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_studio_tables(db)
+    }
+
+    factory studio_sql(sql: Text) returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try run_studio_sql(db, sql)
+    }
+
+    factory studio_ddl(body: StudioDdlBody) returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try run_studio_ddl(db, body)
+    }
+
+    factory studio_row_query(body: StudioRowQuery) returns StudioRowPage or fails RigError {
+        let db = try RigRoutes.db()
+        return try query_studio_rows(db, body)
+    }
+
+    factory studio_row_insert(body: StudioRowWrite) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try insert_studio_values(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory studio_row_patch(body: StudioRowWrite) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try patch_studio_values(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory studio_row_delete(body: StudioRowDelete) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try delete_studio_ids(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory snippets() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_snippets(db)
+    }
+
+    factory snippet_save(body: StudioSnippetBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try save_snippet(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory snippet_delete(body: StudioSnippetBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try delete_snippet(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory auth_users() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_auth_users(db)
+    }
+
+    factory auth_user_save(body: StudioAuthUserBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try save_auth_user(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory auth_user_delete(body: StudioAuthUserBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try delete_auth_user(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory policies() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_policies(db)
+    }
+
+    factory policy_save(body: StudioPolicyBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try save_policy(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory policy_delete(body: StudioPolicyBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try delete_policy(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory buckets() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_buckets(db)
+    }
+
+    factory bucket_save(body: StudioBucketBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try save_bucket(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory objects() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_objects(db)
+    }
+
+    factory object_save(body: StudioObjectBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try save_object(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory object_delete(body: StudioObjectDelete) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try delete_object(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory functions() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_functions(db)
+    }
+
+    factory function_save(body: StudioFunctionBody) returns StudioFunctionResult or fails RigError {
+        let db = try RigRoutes.db()
+        return try save_function(db, body)
+    }
+
+    factory logs() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_studio_logs(db)
+    }
+
+    factory logs_query(body: StudioLogQuery) returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try query_studio_logs(db, body)
+    }
+
+    factory advisors() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_advisors(db)
+    }
+
+    factory migrations() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_migrations(db)
+    }
+
+    factory migration_save(body: StudioMigrationBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try save_migration(db, body)
+        return OkCount.new(count: count)
+    }
+
+    factory webhooks() returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return try list_webhooks(db)
+    }
+
+    factory webhook_save(body: StudioWebhookBody) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try save_webhook(db, body)
+        return OkCount.new(count: count)
+    }
+}
+
+mount rig_health at "/" {
+    route get "/health" {
+        reply with health()
+    }
+}
+
+mount rig_auth at "/auth/v1" {
+    route get "/health" {
+        reply with auth_health()
+    }
+
+    route get "/user" {
+        match RigRoutes.user(request.who) {
+            when success view then { reply with view }
+            when failure error then { reply text explain(error) as "text/plain" status 401 }
+        }
+    }
+}
+
+mount rig_api at "/rest/v1" {
+    mount rig_health
+
+    route get "/todos" {
+        match RigRoutes.list_todos() {
+            when success rows then { reply with rows }
+            when failure error then { reply text explain(error) as "text/plain" status 500 }
+        }
+    }
+
+    route post "/todos" expecting NewTodo as body {
+        match RigRoutes.create_todo(request.who, body) {
+            when success count then { reply with count status 201 }
+            when failure error then { reply text explain(error) as "text/plain" status 400 }
+        }
+    }
+
+    route get "/profiles" {
+        match RigRoutes.list_profiles() {
+            when success rows then { reply with rows }
+            when failure error then { reply text explain(error) as "text/plain" status 500 }
+        }
+    }
+}
+
+mount rig_storage at "/storage/v1" {
+    route get "/object/{*filepath}" {
+        match RigRoutes.storage_file(filepath) {
+            when success target then {
+                reply file target
+            }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 400
+            }
+        }
+    }
+}
+
+mount rig_studio_assets at "/studio" {
+    route get "/rig-mark.svg" {
+        let studio = default_studio()
+        match authorize_studio(studio, request.headers) {
+            when success _ then match resolve_studio(studio, "rig-mark.svg") {
+                when success target then { reply file target }
+                when failure error then {
+                    reply text explain(error) as "text/plain" status 404
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/assets/{*filepath}" {
+        let studio = default_studio()
+        match authorize_studio(studio, request.headers) {
+            when success _ then match resolve_studio(studio, "assets/{filepath}") {
+                when success target then { reply file target }
+                when failure error then {
+                    reply text explain(error) as "text/plain" status 404
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+}
+
+mount rig_studio_api at "/studio-api" {
+    route get "/tables" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_tables() {
+                when success tables then { reply with tables }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/pg-meta/tables" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_tables() {
+                when success tables then { reply with tables }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/sql" expecting StudioSqlBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_sql(body.sql) {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/tables/ddl" expecting StudioDdlBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_ddl(body) {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/meta" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then {
+                reply with studio_meta()
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/auth/config" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.auth_config() {
+                when success view then { reply with view }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/auth/config" expecting StudioAuthConfigBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.save_auth_config(body) {
+                when success view then { reply with view }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/rows" expecting StudioInsertBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_insert(body) {
+                when success count then { reply with count status 201 }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/rows/patch" expecting StudioPatchBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_patch(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/storage" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.storage_listing() {
+                when success listing then { reply with listing }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/rows/query" expecting StudioRowQuery as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_row_query(body) {
+                when success page then { reply with page }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/rows/insert" expecting StudioRowWrite as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_row_insert(body) {
+                when success count then { reply with count status 201 }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/rows/update" expecting StudioRowWrite as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_row_patch(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/rows/delete" expecting StudioRowDelete as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.studio_row_delete(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/snippets" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.snippets() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/snippets" expecting StudioSnippetBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.snippet_save(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/snippets/delete" expecting StudioSnippetBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.snippet_delete(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/auth/users" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.auth_users() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/auth/users" expecting StudioAuthUserBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.auth_user_save(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/auth/users/delete" expecting StudioAuthUserBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.auth_user_delete(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/policies" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.policies() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/policies" expecting StudioPolicyBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.policy_save(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/policies/delete" expecting StudioPolicyBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.policy_delete(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/storage/buckets" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.buckets() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/storage/buckets" expecting StudioBucketBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.bucket_save(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/storage/objects" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.objects() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/storage/objects" expecting StudioObjectBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.object_save(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/storage/objects/delete" expecting StudioObjectDelete as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.object_delete(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/functions" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.functions() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/functions" expecting StudioFunctionBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.function_save(body) {
+                when success result then { reply with result }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/logs" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.logs() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/logs" expecting StudioLogQuery as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.logs_query(body) {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/advisors" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.advisors() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/migrations" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.migrations() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/migrations" expecting StudioMigrationBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.migration_save(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/webhooks" {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.webhooks() {
+                when success rows then { reply with rows }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 500
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route post "/webhooks" expecting StudioWebhookBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.webhook_save(body) {
+                when success count then { reply with count }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status 400
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+}
+
+mount rig_studio at "/studio" {
+    mount rig_studio_api
+    mount rig_studio_assets
+
+    route get "/" {
+        let studio = default_studio()
+        match authorize_studio(studio, request.headers) {
+            when success _ then match resolve_studio(studio, "") {
+                when success target then { reply file target }
+                when failure error then {
+                    reply text explain(error) as "text/plain" status 404
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
+    route get "/{*filepath}" {
+        let studio = default_studio()
+        match authorize_studio(studio, request.headers) {
+            when success _ then match resolve_studio(studio, filepath) {
+                when success target then { reply file target }
+                when failure error then {
+                    reply text explain(error) as "text/plain" status 404
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+}
+
+mount rig {
+    mount rig_auth
+    mount rig_api
+    mount rig_storage
+    mount rig_studio
+}
+
+mount rig_all {
+    mount rig_auth
+    mount rig_api
+    mount rig_storage
+    mount rig_studio
 }

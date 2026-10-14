@@ -5,4 +5,4 @@ rig-storage/
 examples/server/needed.lock
 .DS_Store
 studio/node_modules/
-studio/dist/
+# studio/dist is precompiled and committed so mounts work after `riff install`

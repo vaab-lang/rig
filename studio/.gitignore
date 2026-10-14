@@ -8,7 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# dist is precompiled and committed for tape-style mounts / riff install
 dist-ssr
 *.local
 
