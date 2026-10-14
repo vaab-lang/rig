@@ -46,7 +46,7 @@ type ObjectConfig = {
   columns: { key: string; label: string; mono?: boolean }[]
   load: () => Promise<SqlRow[]>
   fields: Field[]
-  generateSql: (values: Record<string, string>) => string
+  generateSql: (values: Record<string, string>, defaultTable?: string) => string
   createLabel: string
   rowAction?: (row: SqlRow, reload: () => void, online: boolean) => ReactNode
 }
@@ -66,7 +66,8 @@ function SqlObjectCatalog({ config }: { config: ObjectConfig }) {
     enabled: config.fields.some((field) => field.tableSelect),
   })
 
-  const sql = useMemo(() => formatSql(config.generateSql(values)), [config, values])
+  const defaultTable = tablesQuery.data?.[0]?.name || 'profiles'
+  const sql = useMemo(() => formatSql(config.generateSql(values, defaultTable)), [config, values, defaultTable])
   const error = query.error instanceof Error ? query.error.message : null
   const rows = query.data ?? []
 
@@ -267,14 +268,14 @@ const TRIGGERS: ObjectConfig = {
   load: listTriggers,
   createLabel: 'Create',
   fields: [
-    { key: 'name', label: 'Name', placeholder: 'todos_updated' },
+    { key: 'name', label: 'Name', placeholder: 'profiles_updated' },
     { key: 'table', label: 'Table', tableSelect: true },
     { key: 'timing', label: 'Timing', placeholder: 'AFTER INSERT' },
     { key: 'body', label: 'Body', textarea: true, placeholder: 'SELECT 1;' },
   ],
-  generateSql: (values) => {
+  generateSql: (values, defaultTable = 'profiles') => {
     const name = values.name?.trim() || 'new_trigger'
-    const table = values.table?.trim() || 'todos'
+    const table = values.table?.trim() || defaultTable
     const timing = values.timing?.trim() || 'AFTER INSERT'
     const body = values.body?.trim() || 'SELECT 1;'
     return `CREATE TRIGGER ${quoteIdent(name)}\n${timing} ON ${quoteIdent(table)}\nBEGIN\n  ${body}\nEND;`
@@ -294,8 +295,8 @@ const TYPES: ObjectConfig = {
   load: listEnumTypes,
   createLabel: 'Create',
   fields: [
-    { key: 'name', label: 'Name', placeholder: 'todo_status' },
-    { key: 'values', label: 'Values', placeholder: 'open, done' },
+    { key: 'name', label: 'Name', placeholder: 'record_status' },
+    { key: 'values', label: 'Values', placeholder: 'active, archived' },
   ],
   generateSql: (values) => {
     const name = values.name?.trim() || 'new_enum'
@@ -354,14 +355,14 @@ const INDEXES: ObjectConfig = {
   load: listIndexes,
   createLabel: 'Create',
   fields: [
-    { key: 'name', label: 'Name', placeholder: 'todos_owner_idx' },
+    { key: 'name', label: 'Name', placeholder: 'profiles_email_idx' },
     { key: 'table', label: 'Table', tableSelect: true },
-    { key: 'columns', label: 'Columns', placeholder: 'owner' },
+    { key: 'columns', label: 'Columns', placeholder: 'email' },
     { key: 'unique', label: 'Unique', checkbox: true },
   ],
-  generateSql: (values) => {
+  generateSql: (values, defaultTable = 'profiles') => {
     const name = values.name?.trim() || 'new_index'
-    const table = values.table?.trim() || 'todos'
+    const table = values.table?.trim() || defaultTable
     const columns = values.columns?.trim() || 'id'
     const unique = values.unique === 'true' ? 'UNIQUE ' : ''
     return `CREATE ${unique}INDEX ${quoteIdent(name)} ON ${quoteIdent(table)} (${columns});`

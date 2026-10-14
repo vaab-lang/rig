@@ -105,7 +105,7 @@ export function MigrationsLedger() {
                 value={name}
                 disabled={!online || saving}
                 onChange={(event) => setName(event.target.value)}
-                placeholder="add_todos"
+                placeholder="create_items_table"
               />
             </div>
             <div className="grid gap-1.5">

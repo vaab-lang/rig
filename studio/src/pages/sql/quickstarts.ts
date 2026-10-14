@@ -2,27 +2,6 @@ import type { SqlCatalogItem } from './templates'
 
 export const SQL_QUICKSTARTS: SqlCatalogItem[] = [
   {
-    id: 'todo-app',
-    name: 'Todo app',
-    description: 'todos table plus a starter select',
-    sql: `create table if not exists todos (
-  id text primary key,
-  title text not null,
-  owner text not null,
-  done text not null default 'false'
-);
-
-insert into todos (id, title, owner, done)
-values
-  ('1', 'Wire SQL Editor', 'rig', 'false'),
-  ('2', 'Check results grid', 'rig', 'true')
-on conflict (id) do nothing;
-
-select id, title, owner, done
-from todos
-order by id;`,
-  },
-  {
     id: 'profiles-auth',
     name: 'Profiles + Auth',
     description: 'profiles keyed to auth users',

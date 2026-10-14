@@ -27,11 +27,18 @@ import { SnippetTree } from '@/pages/sql/SnippetTree'
 import { formatSql, isWriteSql, parseExplainTree, wrapExplain, type ExplainNode } from '@/pages/sql/sql-utils'
 import { SQL_TEMPLATES, type SqlCatalogItem } from '@/pages/sql/templates'
 
-const TABS_KEY = 'rig.studio.sqlTabs'
-const STARTER = `select id, title, owner, done
-from todos
-order by id desc
+const TABS_KEY = 'rig.studio.sqlTabs.v2'
+const STARTER = `select *
+from profiles
 limit 50`
+
+function starterForTable(table?: { name: string; columns: { name: string }[] }): string {
+  if (!table?.name) return STARTER
+  const cols = table.columns.map((col) => col.name).join(', ') || '*'
+  const orderCol = table.columns[0]?.name
+  const orderClause = orderCol ? `\norder by ${orderCol} desc` : ''
+  return `select ${cols}\nfrom ${table.name}${orderClause}\nlimit 50`
+}
 
 function blankTab(name = 'Untitled', value = STARTER): SqlTab {
   return { id: `tab-${crypto.randomUUID()}`, name, value, dirty: false }
@@ -107,6 +114,19 @@ export function SqlEditorPage() {
     queryKey: ['studio', 'pg-meta', 'tables', role],
     queryFn: () => fetchPgMetaTables(role),
   })
+
+  useEffect(() => {
+    const first = tablesQuery.data?.[0]
+    if (!first) return
+    const nextSql = starterForTable(first)
+    setTabs((current) =>
+      current.map((tab) =>
+        !tab.dirty && tab.value === STARTER
+          ? { ...tab, value: nextSql }
+          : tab,
+      ),
+    )
+  }, [tablesQuery.data])
 
   const snippetsQuery = useQuery({
     queryKey: ['studio', 'snippets', role],

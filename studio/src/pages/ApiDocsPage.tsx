@@ -19,60 +19,89 @@ export function ApiDocsPage() {
   const role = useRoleStore((state) => state.role)
   const tables = useQuery({ queryKey: ['studio', 'tables', role], queryFn: () => fetchStudioTables(role) })
   const [keyKind, setKeyKind] = useState<'anon' | 'service_role'>('anon')
-  const [active, setActive] = useState('health')
+  const [active, setActive] = useState('')
   const base = origin()
   const key = base
 
-  const resources = useMemo<Resource[]>(() => {
-    const extras: Resource[] = [
-      { id: 'health', label: 'Health', kind: 'health' },
+  const tableResources = useMemo<Resource[]>(
+    () =>
+      (tables.data ?? []).map((table) => ({
+        id: `table:${table.name}`,
+        label: table.name,
+        kind: 'table' as const,
+        table,
+      })),
+    [tables.data],
+  )
+
+  const serviceResources = useMemo<Resource[]>(
+    () => [
       { id: 'auth', label: 'Auth', kind: 'auth' },
       { id: 'storage', label: 'Storage', kind: 'storage' },
-    ]
-    const tableResources = (tables.data ?? []).map((table) => ({
-      id: `table:${table.name}`,
-      label: table.name,
-      kind: 'table' as const,
-      table,
-    }))
-    return [...extras, ...tableResources]
-  }, [tables.data])
+      { id: 'health', label: 'Health', kind: 'health' },
+    ],
+    [],
+  )
 
-  const current = resources.find((item) => item.id === active) ?? resources[0]
+  const resources = useMemo<Resource[]>(
+    () => [...tableResources, ...serviceResources],
+    [tableResources, serviceResources],
+  )
+
+  const current = resources.find((item) => item.id === active) ?? tableResources[0] ?? resources[0]
 
   return (
     <div className="flex min-h-0 flex-col lg:flex-row">
-      <aside className="w-full shrink-0 border-b border-border lg:w-56 lg:border-b-0 lg:border-r">
+      <aside className="w-full shrink-0 border-b border-border lg:w-60 lg:border-b-0 lg:border-r">
         <div className="p-3">
-          <p className="mb-2 text-[11px] font-medium text-subtle">Resources</p>
+          <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-subtle">Tables (/rest/v1)</p>
           {tables.isLoading ? (
             <div className="grid gap-2">
               <Skeleton className="h-7" />
               <Skeleton className="h-7" />
             </div>
+          ) : tableResources.length === 0 ? (
+            <p className="px-2 py-1 text-xs text-muted-foreground">No tables yet</p>
           ) : (
             <ul className="grid gap-1">
-              {resources.map((item) => (
+              {tableResources.map((item) => (
                 <li key={item.id}>
                   <button
                     type="button"
                     onClick={() => setActive(item.id)}
-                    className={`w-full rounded-md px-2 py-1.5 text-left text-sm ${
+                    className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left font-mono text-xs ${
                       current?.id === item.id ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-elevated'
                     }`}
                   >
-                    {item.label}
+                    <span className="truncate">/rest/v1/{item.label}</span>
                   </button>
                 </li>
               ))}
             </ul>
           )}
+
+          <p className="mb-2 mt-4 text-[11px] font-medium uppercase tracking-wider text-subtle">Services</p>
+          <ul className="grid gap-1">
+            {serviceResources.map((item) => (
+              <li key={item.id}>
+                <button
+                  type="button"
+                  onClick={() => setActive(item.id)}
+                  className={`w-full rounded-md px-2 py-1.5 text-left text-sm ${
+                    current?.id === item.id ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-elevated'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              </li>
+            ))}
+          </ul>
         </div>
       </aside>
       <div className="min-w-0 flex-1 p-4 md:p-6">
         <PageHeader
           title="API"
-          detail="Generated from tables on this gateway."
+          detail="Live REST endpoints generated from the tables in Studio."
           actions={
             <div className="flex flex-wrap gap-2">
               <div className="inline-flex rounded-md border border-border p-0.5">
@@ -110,6 +139,16 @@ export function ApiDocsPage() {
   )
 }
 
+function samplePayload(table: StudioTableInfo): Record<string, string> {
+  if (!table.columns.length) return { id: '1' }
+  return Object.fromEntries(
+    table.columns.map((column) => [
+      column.name,
+      column.dflt_value ? column.dflt_value.replace(/^'|'$/g, '') : `<${(column.type || 'text').toLowerCase()}>`,
+    ]),
+  )
+}
+
 function ResourceDocs({
   resource,
   base,
@@ -129,9 +168,25 @@ function ResourceDocs({
         : resource.kind === 'storage'
           ? '/storage/v1/object/{path}'
           : '/health'
-  const methods = resource.kind === 'table' ? ['GET', 'POST'] : ['GET']
-  const js = `const res = await fetch('${base}${path}', {\n  headers: {\n    apikey: '${apiKey}',\n    Authorization: 'Bearer ${apiKey}',\n  },\n  credentials: 'include',\n})\nconst data = await res.json()`
-  const curl = `curl '${base}${path}' \\\n  -H "apikey: ${apiKey}" \\\n  -H "Authorization: Bearer ${apiKey}"`
+  const pk =
+    resource.kind === 'table'
+      ? (resource.table.columns.find((col) => col.pk === '1')?.name ?? resource.table.columns[0]?.name ?? 'id')
+      : 'id'
+  const itemPath = resource.kind === 'table' ? `${path}/{${pk}}` : path
+  const methods = resource.kind === 'table' ? ['GET', 'POST', 'PATCH', 'DELETE'] : ['GET']
+  const payloadJson =
+    resource.kind === 'table' ? JSON.stringify(samplePayload(resource.table), null, 2) : '{}'
+
+  const js =
+    resource.kind === 'table'
+      ? `// List ${resource.table.name} rows\nconst listRes = await fetch('${base}${path}', {\n  headers: {\n    apikey: '${apiKey}',\n    Authorization: 'Bearer ${apiKey}',\n  },\n  credentials: 'include',\n})\nconst rows = await listRes.json()\n\n// Get one ${resource.table.name} row by ${pk}\nconst rowRes = await fetch('${base}${path}/1', {\n  headers: {\n    apikey: '${apiKey}',\n    Authorization: 'Bearer ${apiKey}',\n  },\n})\n\n// Insert into ${resource.table.name}\nawait fetch('${base}${path}', {\n  method: 'POST',\n  headers: {\n    'Content-Type': 'application/json',\n    apikey: '${apiKey}',\n    Authorization: 'Bearer ${apiKey}',\n  },\n  body: JSON.stringify(${payloadJson}),\n})\n\n// Patch ${resource.table.name} row\nawait fetch('${base}${path}/1', {\n  method: 'PATCH',\n  headers: {\n    'Content-Type': 'application/json',\n    apikey: '${apiKey}',\n    Authorization: 'Bearer ${apiKey}',\n  },\n  body: JSON.stringify(${payloadJson}),\n})\n\n// Delete ${resource.table.name} row\nawait fetch('${base}${path}/1', {\n  method: 'DELETE',\n  headers: {\n    apikey: '${apiKey}',\n    Authorization: 'Bearer ${apiKey}',\n  },\n})`
+      : `const res = await fetch('${base}${path}', {\n  headers: {\n    apikey: '${apiKey}',\n    Authorization: 'Bearer ${apiKey}',\n  },\n  credentials: 'include',\n})\nconst data = await res.json()`
+
+  const curl =
+    resource.kind === 'table'
+      ? `# List ${resource.table.name}\ncurl '${base}${path}' \\\n  -H "apikey: ${apiKey}" \\\n  -H "Authorization: Bearer ${apiKey}"\n\n# Get ${resource.table.name} by ${pk}\ncurl '${base}${path}/1' \\\n  -H "apikey: ${apiKey}" \\\n  -H "Authorization: Bearer ${apiKey}"\n\n# Insert into ${resource.table.name}\ncurl -X POST '${base}${path}' \\\n  -H "Content-Type: application/json" \\\n  -H "apikey: ${apiKey}" \\\n  -H "Authorization: Bearer ${apiKey}" \\\n  -d '${JSON.stringify(samplePayload(resource.table))}'\n\n# Patch ${resource.table.name}\ncurl -X PATCH '${base}${path}/1' \\\n  -H "Content-Type: application/json" \\\n  -H "apikey: ${apiKey}" \\\n  -H "Authorization: Bearer ${apiKey}" \\\n  -d '${JSON.stringify(samplePayload(resource.table))}'\n\n# Delete from ${resource.table.name}\ncurl -X DELETE '${base}${path}/1' \\\n  -H "apikey: ${apiKey}" \\\n  -H "Authorization: Bearer ${apiKey}"`
+      : `curl '${base}${path}' \\\n  -H "apikey: ${apiKey}" \\\n  -H "Authorization: Bearer ${apiKey}"`
+
   const mountSnippet =
     resource.kind === 'table'
       ? 'mount rig_api at "/rest/v1"'
@@ -140,7 +195,10 @@ function ResourceDocs({
         : resource.kind === 'storage'
           ? 'mount rig_storage at "/storage/v1"'
           : 'mount rig_api at "/rest/v1"'
-  const vaab = `need rig\n\nserve on port 54321 {\n    ${mountSnippet}\n}`
+  const vaab =
+    resource.kind === 'table'
+      ? `need rig\n\nserve on port 54321 {\n    # Exposes ${path} and ${itemPath} for Studio table "${resource.table.name}"\n    ${mountSnippet}\n}`
+      : `need rig\n\nserve on port 54321 {\n    ${mountSnippet}\n}`
   const params =
     resource.kind === 'table'
       ? resource.table.columns.map((column) => `${column.name} (${column.type})`).join(', ') || 'none'
@@ -150,14 +208,17 @@ function ResourceDocs({
     <div className="rounded-md border border-border bg-surface p-4">
       <div className="mb-3 flex flex-wrap items-center gap-2">
         {methods.map((method) => (
-          <Badge key={method} variant={method === 'POST' ? 'warning' : 'success'}>
+          <Badge key={method} variant={method === 'POST' || method === 'PATCH' ? 'warning' : method === 'DELETE' ? 'destructive' : 'success'}>
             {method}
           </Badge>
         ))}
         <span className="font-mono text-[13px]">{path}</span>
+        {resource.kind === 'table' ? (
+          <span className="font-mono text-[12px] text-muted-foreground">· {itemPath}</span>
+        ) : null}
       </div>
       <p className="mb-3 text-sm text-muted-foreground">
-        Key preview uses the window origin as a {keyKind} placeholder. Query params: {params}.
+        Key preview uses the window origin as a {keyKind} placeholder. Columns: {params}.
       </p>
       <Tabs defaultValue="js">
         <TabsList>

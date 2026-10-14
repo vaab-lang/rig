@@ -55,7 +55,7 @@ serve on port 54321 {
 | Mount | Default mount point | Routes (relative to mount point) |
 |-------|---------------------|----------------------------------|
 | `mount rig_auth` | `"/auth/v1"` | `/health`, `/user` |
-| `mount rig_api` | `"/rest/v1"` | `/todos`, `/profiles` (plus `/health`) |
+| `mount rig_api` | `"/rest/v1"` | `/`, `/{table}`, `/{table}/{id}` for every table in Studio (plus `/health`) |
 | `mount rig_storage` | `"/storage/v1"` | `/object/{*filepath}` |
 | `mount rig_studio` | `"/studio"` | `/`, `/{*filepath}` (plus `/studio-api/*`) |
 | `mount rig` | `""` | All of the above (`rig_auth` + `rig_api` + `rig_storage` + `rig_studio`) |
@@ -96,9 +96,10 @@ cd studio && npm run dev   # http://127.0.0.1:54323 → proxies API to :54321
 |------|---------|
 | `rig.connect()` / `connect_with` | `RIG_DATABASE_URL` + optional `RIG_STORAGE_ROOT` |
 | `rig.open_db(client)` / `open_url` | Open the DB and ensure `rig` tables exist |
-| `rig.ensure_schema(db)` | Create `profiles`, `todos`, and `riff_events` tables |
-| `rig.list` / `list_where` / `get` / `remove` | Allow-listed table access |
-| `rig.insert_todo` / `insert_profile` / `patch_todo_done` | Typed writes |
+| `rig.ensure_schema(db)` | Create `profiles`, `riff_events`, and Studio metadata tables |
+| `rig.studio_table_names(db)` | List table names registered in Studio |
+| `rig.list` / `list_where` / `get` / `remove` | Read and delete rows across Studio tables |
+| `rig.insert_row` / `patch_row` / `insert_profile` | Insert and update rows across Studio tables |
 | `rig.track_riff` / `count_riff` | Riff registry install telemetry |
 | `rig.require_user` / `user_view` | Auth adapter over `request.who` |
 | `rig.resolve_object` | Safe object-storage paths |

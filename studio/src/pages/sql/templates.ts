@@ -227,22 +227,21 @@ where json_extract(meta, '$.sku') is not null;`,
   {
     id: 'window-function',
     name: 'Window function',
-    description: 'Row number per owner',
+    description: 'Row number per group',
     sql: `select
   id,
-  owner,
-  title,
-  row_number() over (partition by owner order by id) as n
-from todos;`,
+  name,
+  created_at,
+  row_number() over (order by created_at desc) as n
+from items;`,
   },
   {
     id: 'explain-analyze',
     name: 'Explain analyze',
     description: 'Query plan for a select',
     sql: `explain query plan
-select id, title, owner, done
-from todos
-where done = 'false'
+select id, email, name
+from profiles
 order by id desc;`,
   },
   {

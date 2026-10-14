@@ -507,11 +507,7 @@ export async function insertTableRow(
     await insertRow({
       table,
       id,
-      title: asString(values.title),
-      owner: asString(values.owner),
-      email: asString(values.email),
-      name: asString(values.name),
-      done: asString(values.done),
+      values: stringifyValues(values),
     })
     return { fallback: true }
   }

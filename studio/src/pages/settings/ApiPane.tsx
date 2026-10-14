@@ -1,7 +1,10 @@
+import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { fetchStudioTables } from '@/lib/platform-api'
+import { useRoleStore } from '@/lib/role-store'
 import { origin } from '@/lib/utils'
 
 const PATHS = [
@@ -11,6 +14,9 @@ const PATHS = [
 ]
 
 export function ApiPane() {
+  const role = useRoleStore((state) => state.role)
+  const tables = useQuery({ queryKey: ['studio', 'tables', role], queryFn: () => fetchStudioTables(role) })
+
   function copy(value: string) {
     void navigator.clipboard.writeText(value)
     toast.success('Copied')
@@ -22,6 +28,22 @@ export function ApiPane() {
       {PATHS.map((item) => (
         <Field key={item.path} label={item.label} value={item.path} onCopy={() => copy(`${origin()}${item.path}`)} />
       ))}
+      {(tables.data ?? []).length > 0 ? (
+        <div className="mt-2 grid gap-2">
+          <div className="text-xs font-medium text-muted-foreground">Table endpoints (from Studio)</div>
+          {(tables.data ?? []).map((table) => {
+            const tablePath = `/rest/v1/${table.name}`
+            return (
+              <Field
+                key={table.name}
+                label={table.name}
+                value={tablePath}
+                onCopy={() => copy(`${origin()}${tablePath}`)}
+              />
+            )
+          })}
+        </div>
+      ) : null}
       <div className="grid gap-1.5">
         <Label htmlFor="schemas">PostgREST schemas</Label>
         <Input id="schemas" defaultValue="public" readOnly />

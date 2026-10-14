@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import {
@@ -10,14 +11,20 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { fetchStudioTables } from '@/lib/platform-api'
+import { useRoleStore } from '@/lib/role-store'
 import { origin } from '@/lib/utils'
 
-function snippets(base: string) {
+function snippets(base: string, tableNames: string[]) {
+  const first = tableNames[0] ?? 'profiles'
+  const endpoints = (tableNames.length ? tableNames : [first])
+    .map((table) => `curl '${base}/rest/v1/${table}' \\\n  -H "apikey: ${base}" \\\n  -H "Authorization: Bearer ${base}"`)
+    .join('\n\n')
   return {
     uri: base,
-    rest: `curl '${base}/rest/v1/' \\\n  -H "apikey: ${base}" \\\n  -H "Authorization: Bearer ${base}"`,
+    rest: endpoints,
     vaab: `need rig\n\nserve on port 54321 {\n    mount rig_auth at "/auth/v1"\n    mount rig_api at "/rest/v1"\n    mount rig_storage at "/storage/v1"\n    mount rig_studio at "/studio"\n}`,
-    client: `const PROJECT_URL = "${base}"\nconst ANON_KEY = "${base}"`,
+    client: `const PROJECT_URL = "${base}"\nconst ANON_KEY = "${base}"\n\nconst res = await fetch(\`\${PROJECT_URL}/rest/v1/${first}\`)\nconst rows = await res.json()`,
     mcp: `${base}/mcp`,
     anon: base,
     service: base,
@@ -26,8 +33,11 @@ function snippets(base: string) {
 
 export function ConnectModal() {
   const [open, setOpen] = useState(false)
+  const role = useRoleStore((state) => state.role)
+  const tables = useQuery({ queryKey: ['studio', 'tables', role], queryFn: () => fetchStudioTables(role) })
   const base = origin()
-  const values = useMemo(() => snippets(base), [base])
+  const tableNames = useMemo(() => (tables.data ?? []).map((table) => table.name), [tables.data])
+  const values = useMemo(() => snippets(base, tableNames), [base, tableNames])
 
   function copy(value: string, label: string) {
     void navigator.clipboard.writeText(value)

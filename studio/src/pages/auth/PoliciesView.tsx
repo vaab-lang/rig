@@ -16,7 +16,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { listTables } from '@/lib/api'
+import { fetchStudioTables } from '@/lib/platform-api'
 import {
   deletePolicy,
   listPolicies,
@@ -43,7 +43,7 @@ const EMPTY_BODY: AuthPolicyBody = {
 export function PoliciesView({ schemaFilter }: { schemaFilter?: string }) {
   const online = useOnline()
   const queryClient = useQueryClient()
-  const tablesQuery = useQuery({ queryKey: ['studio', 'tables'], queryFn: listTables })
+  const tablesQuery = useQuery({ queryKey: ['studio', 'tables', 'policies'], queryFn: () => fetchStudioTables() })
   const policiesQuery = useQuery({ queryKey: ['studio', 'policies'], queryFn: listPolicies })
   const [tableName, setTableName] = useState('')
   const [open, setOpen] = useState(false)

@@ -106,26 +106,14 @@ export async function listRows(table: string): Promise<Row[]> {
 export async function insertRow(body: {
   table: string
   id?: string
-  title?: string
-  owner?: string
-  email?: string
-  name?: string
-  done?: string
+  values?: Record<string, string>
 }): Promise<unknown> {
   const response = await fetch(
-    '/studio-api/rows',
+    `/rest/v1/${encodeURIComponent(body.table)}`,
     studioInit({
       method: 'POST',
       headers: jsonHeaders,
-      body: JSON.stringify({
-        table: body.table,
-        id: body.id ?? '',
-        title: body.title ?? '',
-        owner: body.owner ?? '',
-        email: body.email ?? '',
-        name: body.name ?? '',
-        done: body.done ?? '',
-      }),
+      body: JSON.stringify(body.values ?? (body.id ? { id: body.id } : {})),
     }),
   )
   return readJson(response)

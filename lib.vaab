@@ -45,19 +45,36 @@ type UserView {
     email: Text
 }
 
-type Todo {
-    id: Text
-    title: Text
-    owner: Text
-    done: Text
-}
-
-type NewTodo {
-    title: Text
-}
-
 type OkCount {
     count: Int
+}
+
+type RiffPackage {
+    name: Text
+    version: Text
+    description: Text
+    author: Text
+    licence: Text
+    repo: Text
+    needs: Text
+    tags: Text
+    downloads: Int
+    views: Int
+}
+
+type RiffTracked {
+    ok: Bool
+    downloads: Int
+}
+
+type RiffViewed {
+    ok: Bool
+    views: Int
+}
+
+type RegistryHealth {
+    ok: Bool
+    service: Text
 }
 
 # --- connect ---------------------------------------------------------------
@@ -206,8 +223,9 @@ to allow_user_table(table: Text) returns Text or fails RigError {
 
 to ensure_schema(db: Db) returns Int or fails RigError {
     let _p = try exec_sql(db, "create table if not exists profiles (id text primary key, email text not null, name text not null default '')")
-    let _t = try exec_sql(db, "create table if not exists todos (id text primary key, title text not null, owner text not null, done text not null default 'false')")
     let _r = try exec_sql(db, "create table if not exists riff_events (id text primary key, name text not null, kind text not null, ts text not null)")
+    let _rf = try exec_sql(db, "create table if not exists riffs (name text primary key, version text not null, description text not null, author text not null, licence text not null, repo text not null, needs text not null, tags text not null default '')")
+    let _seed_riffs = try seed_registry(db)
     let _c = try exec_sql(db, "create table if not exists studio_config (key text primary key, value text not null)")
     let _u = try exec_sql(db, "create table if not exists auth_users (id text primary key, email text not null, phone text not null default '', provider text not null default 'email', created_at text not null, last_sign_in_at text not null default '', raw_user_meta_data text not null default '', banned_until text not null default '')")
     let _b = try exec_sql(db, "create table if not exists studio_buckets (id text primary key, name text not null, public text not null default 'false', file_size_limit text not null default '', allowed_mime_types text not null default '', created_at text not null, updated_at text not null)")
@@ -247,27 +265,102 @@ to seed_studio(db: Db) returns Int or fails RigError {
 
 # --- riff registry telemetry (riff.vaab.dev) --------------------------------
 
-to known_riff(name: Text) returns Bool {
-    if name == "supabase" { return yes }
-    if name == "tape" { return yes }
-    if name == "rig" { return yes }
-    return no
+to seed_riff(
+    db: Db,
+    name: Text,
+    version: Text,
+    description: Text,
+    author: Text,
+    licence: Text,
+    repo: Text,
+    needs: Text,
+    tags: Text,
+) returns Int or fails RigError {
+    match db.from("riffs").equals("name", name).first() {
+        when success maybe then match maybe {
+            when found _ then { return 0 }
+            when nothing then {
+                match db.from("riffs").insert({
+                    "name": name,
+                    "version": version,
+                    "description": description,
+                    "author": author,
+                    "licence": licence,
+                    "repo": repo,
+                    "needs": needs,
+                    "tags": tags,
+                }) {
+                    when success count then { return count }
+                    when failure error then match error {
+                        when Failed(message) then { fail RigError.Database(message) }
+                    }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
 }
 
-to riff_name_ok(name: Text) returns Bool {
+to seed_registry(db: Db) returns Int or fails RigError {
+    try seed_riff(
+        db,
+        "rig",
+        "0.1.0",
+        "Supabase-shaped backend helpers for Vaab — Postgres/SQLite data API, auth adapter, storage paths, Studio, and riff install tracking.",
+        "vaab-lang",
+        "MIT",
+        "https://github.com/vaab-lang/rig",
+        "vaab at 0.1.4",
+        "database,auth,storage,backend",
+    )
+    try seed_riff(
+        db,
+        "supabase",
+        "0.1.0",
+        "PostgREST client over Vaab’s http.send builtin. Connect, fetch, insert, patch, and delete rows.",
+        "vaab",
+        "MIT",
+        "https://github.com/vaab-lang/vaab-riffs/tree/main/supabase",
+        "vaab at 0.1",
+        "database,api,supabase",
+    )
+    try seed_riff(
+        db,
+        "tape",
+        "0.1.0",
+        "Static file helpers for Vaab HTTP servers. Serve dist folders without a reverse proxy.",
+        "vaab-lang",
+        "MIT",
+        "https://github.com/vaab-lang/tape",
+        "vaab at 0.1",
+        "http,static,server",
+    )
+    return 3
+}
+
+to known_riff(db: Db, name: Text) returns Bool {
+    match db.from("riffs").equals("name", name).count() {
+        when success count then { return count > 0 }
+        when failure _ then { return no }
+    }
+}
+
+to riff_name_ok(db: Db, name: Text) returns Bool {
     if name.is_empty { return no }
     if name.contains("..") { return no }
     if name.contains("/") { return no }
     if name.contains(":") { return no }
     if name.contains(" ") { return no }
-    return known_riff(name)
+    return known_riff(db, name)
 }
 
 to track_riff(db: Db, name: Text, kind: Text) returns Int or fails RigError {
-    if not riff_name_ok(name) {
+    if not riff_name_ok(db, name) {
         fail RigError.BadRequest("unknown or bad riff name")
     }
-    let existing = try count_riff(db, name)
+    let existing = try count_riff_kind(db, name, kind)
     let next = existing + 1
     let id = "{name}-{kind}-{now()}-{next}"
     match db.from("riff_events").insert({"id": id, "name": name, "kind": kind, "ts": "{now()}"}) {
@@ -278,8 +371,20 @@ to track_riff(db: Db, name: Text, kind: Text) returns Int or fails RigError {
     }
 }
 
+to count_riff_kind(db: Db, name: Text, kind: Text) returns Int or fails RigError {
+    if not riff_name_ok(db, name) {
+        fail RigError.BadRequest("unknown or bad riff name")
+    }
+    match db.from("riff_events").equals("name", name).where("kind").is(kind).count() {
+        when success n then { return n }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
 to count_riff(db: Db, name: Text) returns Int or fails RigError {
-    if not riff_name_ok(name) {
+    if not riff_name_ok(db, name) {
         fail RigError.BadRequest("unknown or bad riff name")
     }
     match db.from("riff_events").equals("name", name).count() {
@@ -290,19 +395,170 @@ to count_riff(db: Db, name: Text) returns Int or fails RigError {
     }
 }
 
+to package_with_downloads(db: Db, name: Text) returns RiffPackage or fails RigError {
+    match db.from("riffs").equals("name", name).first() {
+        when success maybe then match maybe {
+            when found row then {
+                let downloads = try count_riff_kind(db, name, "install")
+                let views = try count_riff_kind(db, name, "view")
+                return RiffPackage.new(
+                    name: row.get("name") otherwise name,
+                    version: row.get("version") otherwise "0.0.0",
+                    description: row.get("description") otherwise "",
+                    author: row.get("author") otherwise "",
+                    licence: row.get("licence") otherwise "",
+                    repo: row.get("repo") otherwise "",
+                    needs: row.get("needs") otherwise "",
+                    tags: row.get("tags") otherwise "",
+                    downloads: downloads,
+                    views: views,
+                )
+            }
+            when nothing then { fail RigError.NotFound(name) }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to catalog_riffs(db: Db) returns [RiffPackage] or fails RigError {
+    try seed_registry(db)
+    let rig_pkg = try package_with_downloads(db, "rig")
+    let supabase = try package_with_downloads(db, "supabase")
+    let tape = try package_with_downloads(db, "tape")
+    return [rig_pkg, supabase, tape]
+}
+
+to install_history(db: Db, name: Text) returns [{Text: Text}] or fails RigError {
+    if not riff_name_ok(db, name) {
+        fail RigError.BadRequest("unknown or bad riff name")
+    }
+    let url = env.get("RIG_DATABASE_URL") otherwise ""
+    if url.contains("postgres") {
+        return history_postgres(db, name)
+    }
+    return history_sqlite(db, name)
+}
+
+to history_sqlite(db: Db, name: Text) returns [{Text: Text}] or fails RigError {
+    let sql = "select strftime('%Y-%m-%d', cast(ts as integer), 'unixepoch') as day, cast(sum(case when kind = 'install' then 1 else 0 end) as text) as installs, cast(sum(case when kind = 'view' then 1 else 0 end) as text) as views from riff_events where name = $1 group by 1 order by day asc limit 30"
+    let args: [Text] = [name]
+    match db.query(sql, args) {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to history_postgres(db: Db, name: Text) returns [{Text: Text}] or fails RigError {
+    let sql = "select to_char(to_timestamp(ts::bigint), 'YYYY-MM-DD') as day, cast(sum(case when kind = 'install' then 1 else 0 end) as text) as installs, cast(sum(case when kind = 'view' then 1 else 0 end) as text) as views from riff_events where name = $1 group by 1 order by day asc limit 30"
+    let args: [Text] = [name]
+    match db.query(sql, args) {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to is_postgres() returns Bool {
+    let url = (env.get("RIG_DATABASE_URL") otherwise "").lower()
+    if url.contains("postgres") { return yes }
+    return no
+}
+
+to catalog_table_rows(db: Db) returns [{Text: Text}] or fails RigError {
+    let pg_sql = "select cast(table_name as text) as name, case when table_type = 'VIEW' then 'view' else 'table' end as type, '' as sql from information_schema.tables where table_schema = 'public' and table_name != 'studio_config' order by table_name"
+    let sqlite_sql = "select name, type, coalesce(sql, '') as sql from sqlite_master where type in ('table', 'view') and name not like 'sqlite_%' and name != 'studio_config' order by name"
+    if is_postgres() {
+        return try query_sql(db, pg_sql)
+    }
+    let empty: [Text] = []
+    match db.query(sqlite_sql, empty) {
+        when success rows then { return rows }
+        when failure _ then { return try query_sql(db, pg_sql) }
+    }
+}
+
+to studio_table_names(db: Db) returns [Text] or fails RigError {
+    let rows = try catalog_table_rows(db)
+    return rows.map(row -> row_text(row, "name"))
+}
+
+to has_table_name(names: [Text], target: Text, i: Int) returns Bool {
+    if i >= names.count { return no }
+    if names[i] == target { return yes }
+    return has_table_name(names, target, i + 1)
+}
+
+to allow_studio_table(db: Db, table: Text) returns Text or fails RigError {
+    let name = try allow_user_table(table)
+    let names = try studio_table_names(db)
+    if has_table_name(names, name, 0) {
+        return name
+    }
+    fail RigError.NotFound(name)
+}
+
 to allow_table(table: Text) returns Text or fails RigError {
-    if table == "todos" { return table }
-    if table == "profiles" { return table }
-    fail RigError.Forbidden(table)
+    return try allow_user_table(table)
+}
+
+to table_columns(db: Db, name: Text) returns [{Text: Text}] {
+    if not ident_ok(name) { return empty_rows() }
+    let pg_sql = "select cast(c.ordinal_position - 1 as text) as cid, cast(c.column_name as text) as name, cast(c.data_type as text) as type, case when c.is_nullable = 'NO' then '1' else '0' end as notnull, coalesce(cast(c.column_default as text), '') as dflt_value, case when exists (select 1 from information_schema.table_constraints tc join information_schema.key_column_usage kcu on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema where tc.constraint_type = 'PRIMARY KEY' and tc.table_schema = 'public' and tc.table_name = '{name}' and kcu.column_name = c.column_name) then '1' else '0' end as pk from information_schema.columns c where c.table_schema = 'public' and c.table_name = '{name}' order by c.ordinal_position"
+    if is_postgres() {
+        return pragma_rows(db, pg_sql)
+    }
+    let cols = pragma_rows(db, "PRAGMA table_info({name})")
+    if not cols.is_empty { return cols }
+    return pragma_rows(db, pg_sql)
+}
+
+to table_foreign_keys(db: Db, name: Text) returns [{Text: Text}] {
+    if not ident_ok(name) { return empty_rows() }
+    let pg_sql = "select cast(kcu.column_name as text) as \"from\", cast(ccu.table_name as text) as \"table\", cast(ccu.column_name as text) as \"to\" from information_schema.table_constraints tc join information_schema.key_column_usage kcu on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema join information_schema.constraint_column_usage ccu on ccu.constraint_name = tc.constraint_name and ccu.table_schema = tc.table_schema where tc.constraint_type = 'FOREIGN KEY' and tc.table_schema = 'public' and tc.table_name = '{name}'"
+    if is_postgres() {
+        return pragma_rows(db, pg_sql)
+    }
+    return pragma_rows(db, "PRAGMA foreign_key_list({name})")
+}
+
+to table_indexes(db: Db, name: Text) returns [{Text: Text}] {
+    if not ident_ok(name) { return empty_rows() }
+    let pg_sql = "select cast(indexname as text) as name, cast(indexdef as text) as origin from pg_indexes where schemaname = 'public' and tablename = '{name}'"
+    if is_postgres() {
+        return pragma_rows(db, pg_sql)
+    }
+    return pragma_rows(db, "PRAGMA index_list({name})")
+}
+
+to pk_from_cols(cols: [{Text: Text}], i: Int) returns Text {
+    if i >= cols.count {
+        if cols.is_empty { return "id" }
+        let first = row_text(cols[0], "name")
+        if first.is_empty { return "id" }
+        return first
+    }
+    let col = cols[i]
+    if row_text(col, "pk") == "1" {
+        let pk_name = row_text(col, "name")
+        if not pk_name.is_empty { return pk_name }
+    }
+    return pk_from_cols(cols, i + 1)
+}
+
+to primary_key(db: Db, table: Text) returns Text {
+    if not ident_ok(table) { return "id" }
+    return pk_from_cols(table_columns(db, table), 0)
 }
 
 to list(db: Db, table: Text) returns [{Text: Text}] or fails RigError {
-    if table != "todos" {
-        if table != "profiles" {
-            fail RigError.Forbidden(table)
-        }
-    }
-    match db.from(table).order_desc("id").all() {
+    let name = try allow_studio_table(db, table)
+    let pk = primary_key(db, name)
+    match db.from(name).order_desc(pk).all() {
         when success rows then { return rows }
         when failure error then match error {
             when Failed(message) then { fail RigError.Database(message) }
@@ -311,12 +567,10 @@ to list(db: Db, table: Text) returns [{Text: Text}] or fails RigError {
 }
 
 to list_where(db: Db, table: Text, column: Text, value: Text) returns [{Text: Text}] or fails RigError {
-    if table != "todos" {
-        if table != "profiles" {
-            fail RigError.Forbidden(table)
-        }
-    }
-    match db.from(table).equals(column, value).order_desc("id").all() {
+    let name = try allow_studio_table(db, table)
+    let col = try ident(column)
+    let pk = primary_key(db, name)
+    match db.from(name).equals(col, value).order_desc(pk).all() {
         when success rows then { return rows }
         when failure error then match error {
             when Failed(message) then { fail RigError.Database(message) }
@@ -325,25 +579,13 @@ to list_where(db: Db, table: Text, column: Text, value: Text) returns [{Text: Te
 }
 
 to get(db: Db, table: Text, id: Text) returns {Text: Text} or fails RigError {
-    if table != "todos" {
-        if table != "profiles" {
-            fail RigError.Forbidden(table)
-        }
-    }
-    match db.from(table).equals("id", id).first() {
+    let name = try allow_studio_table(db, table)
+    let pk = primary_key(db, name)
+    match db.from(name).equals(pk, id).first() {
         when success maybe then match maybe {
             when found row then { return row }
             when nothing then { fail RigError.NotFound(id) }
         }
-        when failure error then match error {
-            when Failed(message) then { fail RigError.Database(message) }
-        }
-    }
-}
-
-to insert_todo(db: Db, id: Text, title: Text, owner: Text) returns Int or fails RigError {
-    match db.from("todos").insert({"id": id, "title": title, "owner": owner, "done": "false"}) {
-        when success count then { return count }
         when failure error then match error {
             when Failed(message) then { fail RigError.Database(message) }
         }
@@ -359,8 +601,35 @@ to insert_profile(db: Db, id: Text, email: Text, name: Text) returns Int or fail
     }
 }
 
-to patch_todo_done(db: Db, id: Text, done: Text) returns Int or fails RigError {
-    match db.from("todos").equals("id", id).update({"done": done}) {
+to insert_row(db: Db, table: Text, values: {Text: Text}) returns Int or fails RigError {
+    let name = try allow_studio_table(db, table)
+    if values.is_empty {
+        fail RigError.BadRequest("values required")
+    }
+    if not values_ok(values) {
+        fail RigError.BadRequest("bad column name")
+    }
+    match db.from(name).insert(values) {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to patch_row(db: Db, table: Text, id: Text, values: {Text: Text}) returns Int or fails RigError {
+    let name = try allow_studio_table(db, table)
+    if id.is_empty {
+        fail RigError.BadRequest("id required")
+    }
+    if values.is_empty {
+        fail RigError.BadRequest("values required")
+    }
+    if not values_ok(values) {
+        fail RigError.BadRequest("bad column name")
+    }
+    let pk = primary_key(db, name)
+    match db.from(name).equals(pk, id).update(values) {
         when success count then {
             if count == 0 { fail RigError.NotFound(id) }
             return count
@@ -372,12 +641,9 @@ to patch_todo_done(db: Db, id: Text, done: Text) returns Int or fails RigError {
 }
 
 to remove(db: Db, table: Text, id: Text) returns Int or fails RigError {
-    if table != "todos" {
-        if table != "profiles" {
-            fail RigError.Forbidden(table)
-        }
-    }
-    match db.from(table).equals("id", id).delete() {
+    let name = try allow_studio_table(db, table)
+    let pk = primary_key(db, name)
+    match db.from(name).equals(pk, id).delete() {
         when success count then {
             if count == 0 { fail RigError.NotFound(id) }
             return count
@@ -597,11 +863,8 @@ type StudioAuthConfigView {
 type StudioInsertBody {
     table: Text
     id: Text
-    title: Text
-    owner: Text
     email: Text
     name: Text
-    done: Text
 }
 
 type StudioPatchBody {
@@ -960,23 +1223,10 @@ to put_auth_config(db: Db, incoming: StudioAuthConfigBody) returns StudioAuthCon
 }
 
 to insert_studio_row(db: Db, body: StudioInsertBody) returns Int or fails RigError {
-    let allowed = try allow_table(body.table)
-    if allowed == "todos" {
-        let row_id = nonempty(body.id, "{body.title}-{now()}")
-        let owner_id = nonempty(body.owner, "studio")
-        let done_val = nonempty(body.done, "false")
-        match db.from("todos").insert({"id": row_id, "title": body.title, "owner": owner_id, "done": done_val}) {
-            when success count then { return count }
-            when failure error then match error {
-                when Failed(message) then { fail RigError.Database(message) }
-            }
-        }
-    }
-    if allowed == "profiles" {
-        let row_id = nonempty(body.id, body.email)
-        if row_id.is_empty {
-            fail RigError.BadRequest("id or email required")
-        }
+    let table = try allow_studio_table(db, body.table)
+    let pk = primary_key(db, table)
+    let row_id = nonempty(body.id, nonempty(body.email, nonempty(body.name, "row-{now()}")))
+    if table == "profiles" {
         match db.from("profiles").insert({"id": row_id, "email": body.email, "name": body.name}) {
             when success count then { return count }
             when failure error then match error {
@@ -984,70 +1234,30 @@ to insert_studio_row(db: Db, body: StudioInsertBody) returns Int or fails RigErr
             }
         }
     }
-    fail RigError.Forbidden(body.table)
+    match db.from(table).insert({pk: row_id}) {
+        when success count then { return count }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
 }
 
 to patch_studio_row(db: Db, body: StudioPatchBody) returns Int or fails RigError {
-    let allowed = try allow_table(body.table)
+    let table = try allow_studio_table(db, body.table)
     if body.id.is_empty {
         fail RigError.BadRequest("id required")
     }
-    if body.column == "title" {
-        match db.from(allowed).equals("id", body.id).update({"title": body.value}) {
-            when success count then {
-                if count == 0 { fail RigError.NotFound(body.id) }
-                return count
-            }
-            when failure error then match error {
-                when Failed(message) then { fail RigError.Database(message) }
-            }
+    let col = try ident(body.column)
+    let pk = primary_key(db, table)
+    match db.from(table).equals(pk, body.id).update({col: body.value}) {
+        when success count then {
+            if count == 0 { fail RigError.NotFound(body.id) }
+            return count
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
         }
     }
-    if body.column == "owner" {
-        match db.from(allowed).equals("id", body.id).update({"owner": body.value}) {
-            when success count then {
-                if count == 0 { fail RigError.NotFound(body.id) }
-                return count
-            }
-            when failure error then match error {
-                when Failed(message) then { fail RigError.Database(message) }
-            }
-        }
-    }
-    if body.column == "done" {
-        match db.from(allowed).equals("id", body.id).update({"done": body.value}) {
-            when success count then {
-                if count == 0 { fail RigError.NotFound(body.id) }
-                return count
-            }
-            when failure error then match error {
-                when Failed(message) then { fail RigError.Database(message) }
-            }
-        }
-    }
-    if body.column == "email" {
-        match db.from(allowed).equals("id", body.id).update({"email": body.value}) {
-            when success count then {
-                if count == 0 { fail RigError.NotFound(body.id) }
-                return count
-            }
-            when failure error then match error {
-                when Failed(message) then { fail RigError.Database(message) }
-            }
-        }
-    }
-    if body.column == "name" {
-        match db.from(allowed).equals("id", body.id).update({"name": body.value}) {
-            when success count then {
-                if count == 0 { fail RigError.NotFound(body.id) }
-                return count
-            }
-            when failure error then match error {
-                when Failed(message) then { fail RigError.Database(message) }
-            }
-        }
-    }
-    fail RigError.BadRequest("unknown column")
 }
 
 # --- Studio operator API (introspection, SQL, generic rows, extras) ----------
@@ -1088,14 +1298,14 @@ to describe_table(db: Db, row: {Text: Text}) returns StudioTableInfo {
         sql: sql,
         row_count: table_count(db, name),
         rls_enabled: rls_flag(db, name),
-        columns: pragma_rows(db, "PRAGMA table_info({name})"),
-        foreign_keys: pragma_rows(db, "PRAGMA foreign_key_list({name})"),
-        indexes: pragma_rows(db, "PRAGMA index_list({name})"),
+        columns: table_columns(db, name),
+        foreign_keys: table_foreign_keys(db, name),
+        indexes: table_indexes(db, name),
     )
 }
 
 to list_studio_tables(db: Db) returns [StudioTableInfo] or fails RigError {
-    let rows = try query_sql(db, "select name, type, sql from sqlite_master where type in ('table', 'view') and name not like 'sqlite_%' order by name")
+    let rows = try catalog_table_rows(db)
     return rows.map(row -> describe_table(db, row))
 }
 
@@ -1311,20 +1521,6 @@ to run_studio_ddl(db: Db, body: StudioDdlBody) returns [{Text: Text}] or fails R
         return try run_studio_sql(db, body.sql)
     }
     fail RigError.BadRequest("unknown ddl action")
-}
-
-to pk_from_cols(cols: [{Text: Text}], i: Int) returns Text {
-    if i >= cols.count { return "id" }
-    let col = cols[i]
-    if row_text(col, "pk") == "1" {
-        return nonempty(row_text(col, "name"), "id")
-    }
-    return pk_from_cols(cols, i + 1)
-}
-
-to primary_key(db: Db, table: Text) returns Text {
-    if not ident_ok(table) { return "id" }
-    return pk_from_cols(pragma_rows(db, "PRAGMA table_info({table})"), 0)
 }
 
 to apply_filter(q: Query, filter: {Text: Text}) returns Query {
@@ -1943,7 +2139,7 @@ to write_table_lints(db: Db, row: {Text: Text}) {
         let _v = log_studio(db, "advisor", "INFO", "GET", "/studio-api/advisors", "exposed view {name}", "", "0")
         return
     }
-    let columns = pragma_rows(db, "PRAGMA table_info({name})")
+    let columns = table_columns(db, name)
     if not has_pk(columns, 0) {
         let _p = log_studio(db, "advisor", "ERROR", "GET", "/studio-api/advisors", "table missing primary key {name}", "", "0")
     }
@@ -1952,12 +2148,12 @@ to write_table_lints(db: Db, row: {Text: Text}) {
             let _r = log_studio(db, "advisor", "WARN", "GET", "/studio-api/advisors", "table without RLS policies {name}", "", "0")
         }
     }
-    write_fk_lints(db, name, pragma_rows(db, "PRAGMA foreign_key_list({name})"), pragma_rows(db, "PRAGMA index_list({name})"), 0)
+    write_fk_lints(db, name, table_foreign_keys(db, name), table_indexes(db, name), 0)
 }
 
 to list_advisors(db: Db) returns [{Text: Text}] or fails RigError {
     let _c = try exec_sql(db, "delete from studio_logs where service = 'advisor'")
-    let tables = try query_sql(db, "select name, type, sql from sqlite_master where type in ('table', 'view') and name not like 'sqlite_%'")
+    let tables = try catalog_table_rows(db)
     tables.each(row -> write_table_lints(db, row))
     match db.from("studio_logs").equals("service", "advisor").order_desc("id").all() {
         when success rows then { return rows }
@@ -2073,6 +2269,31 @@ to auth_health() returns Health {
     return Health.new(name: "rig-auth", ok: yes, version: "0.1.0")
 }
 
+to registry_health() returns RegistryHealth {
+    return RegistryHealth.new(ok: yes, service: "riff")
+}
+
+to catalog_web_root() returns Text {
+    match env.get("RIG_CATALOG_WEB_ROOT") {
+        when found root then { return root }
+        when nothing then { return "web/dist" }
+    }
+}
+
+to resolve_catalog(requested: Text) returns Text or fails RigError {
+    if requested.contains("..") {
+        fail RigError.Unsafe(requested)
+    }
+    let root = catalog_web_root()
+    if requested.is_empty {
+        return "{root}/index.html"
+    }
+    if requested.contains(".") {
+        return "{root}/{requested}"
+    }
+    return "{root}/index.html"
+}
+
 to explain(error: RigError) returns Text {
     match error {
         when Missing(name) then { return "missing {name}" }
@@ -2099,9 +2320,44 @@ cast RigRoutes {
         return open_db(client)
     }
 
-    factory list_todos() returns [{Text: Text}] or fails RigError {
+    factory api_tables() returns [StudioTableInfo] or fails RigError {
         let db = try RigRoutes.db()
-        return list(db, "todos")
+        return try list_studio_tables(db)
+    }
+
+    factory list_table(table: Text) returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        let rows = try list(db, table)
+        let _l = log_studio(db, "api", "info", "GET", "/rest/v1/{table}", "select {table}", "200", "0")
+        return rows
+    }
+
+    factory get_table_row(table: Text, id: Text) returns {Text: Text} or fails RigError {
+        let db = try RigRoutes.db()
+        let row = try get(db, table, id)
+        let _l = log_studio(db, "api", "info", "GET", "/rest/v1/{table}/{id}", "get {table} {id}", "200", "0")
+        return row
+    }
+
+    factory insert_table_row(table: Text, values: {Text: Text}) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try insert_row(db, table, values)
+        let _l = log_studio(db, "api", "info", "POST", "/rest/v1/{table}", "insert {table}", "201", "0")
+        return OkCount.new(count: count)
+    }
+
+    factory patch_table_row(table: Text, id: Text, values: {Text: Text}) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try patch_row(db, table, id, values)
+        let _l = log_studio(db, "api", "info", "PATCH", "/rest/v1/{table}/{id}", "patch {table} {id}", "200", "0")
+        return OkCount.new(count: count)
+    }
+
+    factory delete_table_row(table: Text, id: Text) returns OkCount or fails RigError {
+        let db = try RigRoutes.db()
+        let count = try remove(db, table, id)
+        let _l = log_studio(db, "api", "info", "DELETE", "/rest/v1/{table}/{id}", "delete {table} {id}", "200", "0")
+        return OkCount.new(count: count)
     }
 
     factory list_profiles() returns [{Text: Text}] or fails RigError {
@@ -2112,14 +2368,6 @@ cast RigRoutes {
     factory user(who: User or fails AuthError) returns UserView or fails RigError {
         let user = try require_user(who)
         return user_view(user)
-    }
-
-    factory create_todo(who: User or fails AuthError, body: NewTodo) returns OkCount or fails RigError {
-        let user = try require_user(who)
-        let db = try RigRoutes.db()
-        let id = "{user.id}-{body.title}"
-        let count = try insert_todo(db, id, body.title, user.id)
-        return OkCount.new(count: count)
     }
 
     factory storage_file(filepath: Text) returns Text or fails RigError {
@@ -2318,6 +2566,86 @@ cast RigRoutes {
         let count = try save_webhook(db, body)
         return OkCount.new(count: count)
     }
+
+    factory riff_catalog() returns [RiffPackage] or fails RigError {
+        let db = try RigRoutes.db()
+        return catalog_riffs(db)
+    }
+
+    factory riff_package(name: Text) returns RiffPackage or fails RigError {
+        let db = try RigRoutes.db()
+        return package_with_downloads(db, name)
+    }
+
+    factory riff_history(name: Text) returns [{Text: Text}] or fails RigError {
+        let db = try RigRoutes.db()
+        return install_history(db, name)
+    }
+
+    factory riff_track_install(name: Text) returns RiffTracked or fails RigError {
+        let db = try RigRoutes.db()
+        if not riff_name_ok(db, name) {
+            fail RigError.BadRequest("riff not found")
+        }
+        let downloads = try track_riff(db, name, "install")
+        return RiffTracked.new(ok: yes, downloads: downloads)
+    }
+
+    factory riff_track_view(name: Text) returns RiffViewed or fails RigError {
+        let db = try RigRoutes.db()
+        if not riff_name_ok(db, name) {
+            fail RigError.BadRequest("riff not found")
+        }
+        let views = try track_riff(db, name, "view")
+        return RiffViewed.new(ok: yes, views: views)
+    }
+}
+
+mount rig_registry at "/api" {
+    route get "/riffs" {
+        match RigRoutes.riff_catalog() {
+            when success rows then { reply with rows }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 400
+            }
+        }
+    }
+
+    route get "/riffs/{name: Text}" {
+        match RigRoutes.riff_package(name) {
+            when success pkg then { reply with pkg }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 400
+            }
+        }
+    }
+
+    route get "/riffs/{name: Text}/history" {
+        match RigRoutes.riff_history(name) {
+            when success rows then { reply with rows }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 400
+            }
+        }
+    }
+
+    route post "/riffs/{name: Text}/track" {
+        match RigRoutes.riff_track_install(name) {
+            when success tracked then { reply with tracked }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 400
+            }
+        }
+    }
+
+    route post "/riffs/{name: Text}/view" {
+        match RigRoutes.riff_track_view(name) {
+            when success viewed then { reply with viewed }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 400
+            }
+        }
+    }
 }
 
 mount rig_health at "/" {
@@ -2342,24 +2670,45 @@ mount rig_auth at "/auth/v1" {
 mount rig_api at "/rest/v1" {
     mount rig_health
 
-    route get "/todos" {
-        match RigRoutes.list_todos() {
-            when success rows then { reply with rows }
+    route get "/" {
+        match RigRoutes.api_tables() {
+            when success tables then { reply with tables }
             when failure error then { reply text explain(error) as "text/plain" status 500 }
         }
     }
 
-    route post "/todos" expecting NewTodo as body {
-        match RigRoutes.create_todo(request.who, body) {
+    route get "/{table: Text}" {
+        match RigRoutes.list_table(table) {
+            when success rows then { reply with rows }
+            when failure error then { reply text explain(error) as "text/plain" status 404 }
+        }
+    }
+
+    route get "/{table: Text}/{id: Text}" {
+        match RigRoutes.get_table_row(table, id) {
+            when success row then { reply with row }
+            when failure error then { reply text explain(error) as "text/plain" status 404 }
+        }
+    }
+
+    route post "/{table: Text}" expecting {Text: Text} as body {
+        match RigRoutes.insert_table_row(table, body) {
             when success count then { reply with count status 201 }
             when failure error then { reply text explain(error) as "text/plain" status 400 }
         }
     }
 
-    route get "/profiles" {
-        match RigRoutes.list_profiles() {
-            when success rows then { reply with rows }
-            when failure error then { reply text explain(error) as "text/plain" status 500 }
+    route patch "/{table: Text}/{id: Text}" expecting {Text: Text} as body {
+        match RigRoutes.patch_table_row(table, id, body) {
+            when success count then { reply with count }
+            when failure error then { reply text explain(error) as "text/plain" status 400 }
+        }
+    }
+
+    route delete "/{table: Text}/{id: Text}" {
+        match RigRoutes.delete_table_row(table, id) {
+            when success count then { reply with count }
+            when failure error then { reply text explain(error) as "text/plain" status 400 }
         }
     }
 }
@@ -2956,6 +3305,45 @@ mount rig_studio at "/studio" {
             }
             when failure _ then {
                 reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+}
+
+mount rig_riff at "" {
+    mount rig_registry at "/api"
+    mount rig_auth at "/auth/v1"
+    mount rig_api at "/rest/v1"
+    mount rig_storage at "/storage/v1"
+    mount rig_studio at "/studio"
+
+    route get "/health" {
+        reply with registry_health()
+    }
+
+    route get "/" {
+        match resolve_catalog("index.html") {
+            when success target then { reply file target }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 403
+            }
+        }
+    }
+
+    route get "/packages/{name: Text}" {
+        match resolve_catalog("index.html") {
+            when success target then { reply file target }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 403
+            }
+        }
+    }
+
+    route get "/{*filepath}" {
+        match resolve_catalog(filepath) {
+            when success target then { reply file target }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status 403
             }
         }
     }
