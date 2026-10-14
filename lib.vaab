@@ -221,7 +221,29 @@ to allow_user_table(table: Text) returns Text or fails RigError {
     return name
 }
 
+to schema_is_ready(db: Db) returns Bool {
+    match db.from("studio_config").equals("key", "schema_ready_v2").first() {
+        when success maybe then match maybe {
+            when found _ then { return yes }
+            when nothing then { return no }
+        }
+        when failure _ then { return no }
+    }
+}
+
+to drop_legacy_todos_table(db: Db) returns Int {
+    let empty: [Text] = []
+    match db.execute("drop table if exists todos", empty) {
+        when success count then { return count }
+        when failure _ then { return 0 }
+    }
+}
+
 to ensure_schema(db: Db) returns Int or fails RigError {
+    if schema_is_ready(db) {
+        return 1
+    }
+    let _legacy = drop_legacy_todos_table(db)
     let _p = try exec_sql(db, "create table if not exists profiles (id text primary key, email text not null, name text not null default '')")
     let _r = try exec_sql(db, "create table if not exists riff_events (id text primary key, name text not null, kind text not null, ts text not null)")
     let _rf = try exec_sql(db, "create table if not exists riffs (name text primary key, version text not null, description text not null, author text not null, licence text not null, repo text not null, needs text not null, tags text not null default '')")
@@ -236,7 +258,9 @@ to ensure_schema(db: Db) returns Int or fails RigError {
     let _m = try exec_sql(db, "create table if not exists studio_migrations (version text primary key, name text not null, statements text not null default '', applied_at text not null)")
     let _g = try exec_sql(db, "create table if not exists studio_logs (id text primary key, ts text not null, service text not null, level text not null, status_code text not null default '', method text not null default '', path text not null default '', msg text not null default '', duration_ms text not null default '0')")
     let _w = try exec_sql(db, "create table if not exists studio_webhooks (id text primary key, name text not null, table_name text not null, events text not null default '', url text not null, method text not null default 'POST', headers text not null default '', enabled text not null default 'true', created_at text not null)")
-    return try seed_studio(db)
+    let _seeded = try seed_studio(db)
+    let _ready = try config_set(db, "schema_ready_v2", "1")
+    return _seeded
 }
 
 to seed_studio(db: Db) returns Int or fails RigError {
