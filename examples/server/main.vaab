@@ -14,5 +14,10 @@ serve on port 54321 {
     mount rig_auth at "/auth/v1"
     mount rig_api at "/rest/v1"
     mount rig_storage at "/storage/v1"
+    mount rig_functions at "/functions/v1"
     mount rig_studio at "/studio"
+
+    socket "/realtime/v1/websocket" as client {
+        rig.listen_realtime(client)
+    }
 }

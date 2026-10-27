@@ -152,6 +152,24 @@ export function TableEditorPage() {
     placeholderData: keepPreviousData,
   })
 
+  useEffect(() => {
+    const table = activeRef?.table
+    if (!realtime || !table) return
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const socket = new WebSocket(`${proto}//${window.location.host}/realtime/v1/websocket`)
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(String(event.data)) as { table?: string; event?: string }
+        if (message.table !== table) return
+        toast.success(`${message.event ?? 'change'} ${table}`)
+        void queryClient.invalidateQueries({ queryKey: ['studio', 'rows'] })
+      } catch {
+        return
+      }
+    }
+    return () => socket.close()
+  }, [realtime, activeRef?.table, queryClient])
+
   const canPatch = metaQuery.data?.can_patch !== false && !offline
   const canInsert = metaQuery.data?.can_insert !== false && !offline
   const fallback = Boolean(rowsQuery.data?.fallback)

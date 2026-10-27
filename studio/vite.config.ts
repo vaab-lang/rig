@@ -18,6 +18,8 @@ export default defineConfig({
       '/auth': 'http://127.0.0.1:54321',
       '/rest': 'http://127.0.0.1:54321',
       '/storage': 'http://127.0.0.1:54321',
+      '/realtime': { target: 'http://127.0.0.1:54321', ws: true },
+      '/functions': 'http://127.0.0.1:54321',
       '/studio-api': 'http://127.0.0.1:54321',
     },
   },

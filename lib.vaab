@@ -737,6 +737,36 @@ to insert_profile(db: Db, id: Text, email: Text, name: Text) returns Int or fail
     }
 }
 
+let realtime_hub = Hub.new(of: Text)
+
+to publish_change(table: Text, event: Text, id: Text) {
+    if is_credential_table(table) { return }
+    match memory_db() {
+        when success mem then match query_args(mem, "select json_object('table', ?1, 'event', ?2, 'id', ?3) as r", [table, event, id]) {
+            when success rows then {
+                if not rows.is_empty {
+                    let message = rows[0].get("r") otherwise ""
+                    if not message.is_empty { realtime_hub.broadcast(message) }
+                }
+            }
+            when failure _ then {}
+        }
+        when failure _ then {}
+    }
+}
+
+to listen_realtime(client: Socket) {
+    realtime_hub.join(client)
+    while yes {
+        match receive from client.messages {
+            when found message then {
+                if not message.is_empty { realtime_hub.broadcast(message) }
+            }
+            when nothing then { return }
+        }
+    }
+}
+
 to insert_row(db: Db, table: Text, values: {Text: Text}) returns Int or fails RigError {
     let name = try allow_studio_table(db, table)
     if values.is_empty {
@@ -746,7 +776,10 @@ to insert_row(db: Db, table: Text, values: {Text: Text}) returns Int or fails Ri
         fail RigError.BadRequest("bad column name")
     }
     match db.from(name).insert(values) {
-        when success count then { return count }
+        when success count then {
+            publish_change(name, "INSERT", values.get("id") otherwise "")
+            return count
+        }
         when failure error then match error {
             when Failed(message) then { fail RigError.Database(message) }
         }
@@ -768,6 +801,7 @@ to patch_row(db: Db, table: Text, id: Text, values: {Text: Text}) returns Int or
     match db.from(name).equals(pk, id).update(values) {
         when success count then {
             if count == 0 { fail RigError.NotFound(id) }
+            publish_change(name, "UPDATE", id)
             return count
         }
         when failure error then match error {
@@ -782,6 +816,7 @@ to remove(db: Db, table: Text, id: Text) returns Int or fails RigError {
     match db.from(name).equals(pk, id).delete() {
         when success count then {
             if count == 0 { fail RigError.NotFound(id) }
+            publish_change(name, "DELETE", id)
             return count
         }
         when failure error then match error {
@@ -1112,6 +1147,22 @@ type StudioObjectDelete {
     id: Text
     bucket_id: Text
     name: Text
+}
+
+type StudioSignBody {
+    bucket: Text
+    name: Text
+    expires_in: Text
+}
+
+type StudioSignResult {
+    url: Text
+    expires_at: Text
+}
+
+type StoredBytes {
+    body: Text
+    mime: Text
 }
 
 type StudioFunctionBody {
@@ -1685,6 +1736,62 @@ to apply_filter(q: Query, filter: {Text: Text}) returns Query {
 to apply_filters(q: Query, filters: [{Text: Text}], i: Int) returns Query {
     if i >= filters.count { return q }
     return apply_filters(apply_filter(q, filters[i]), filters, i + 1)
+}
+
+to pair_split(text: Text, sep: Text) returns {Text: Text} or fails RigError {
+    let db = try memory_db()
+    let rows = try query_args(db, "select case when instr(?1, ?2) = 0 then ?1 else substr(?1, 1, instr(?1, ?2) - 1) end as head, case when instr(?1, ?2) = 0 then '' else substr(?1, instr(?1, ?2) + length(?2)) end as tail", [text, sep])
+    if rows.is_empty { return {"head": text, "tail": ""} }
+    return rows[0]
+}
+
+to rest_number(raw: Text, key: Text, fallback: Int) returns Int or fails RigError {
+    if raw.is_empty { return fallback }
+    let parts = try pair_split(raw, "&")
+    let kv = try pair_split(parts.get("head") otherwise "", "=")
+    if (kv.get("head") otherwise "") == key {
+        match from_json(kv.get("tail") otherwise "", as: Int) {
+            when success n then { return n }
+            when failure _ then { return fallback }
+        }
+    }
+    return try rest_number(parts.get("tail") otherwise "", key, fallback)
+}
+
+to apply_rest_pair(q: Query, pair: Text) returns Query or fails RigError {
+    if pair.is_empty { return q }
+    let kv = try pair_split(pair, "=")
+    let key = kv.get("head") otherwise ""
+    let value = kv.get("tail") otherwise ""
+    if key == "limit" or key == "offset" { return q }
+    if key == "order" {
+        let spec = try pair_split(value, ".")
+        let column = spec.get("head") otherwise ""
+        let dir = spec.get("tail") otherwise "asc"
+        if not ident_ok(column) { return q }
+        if dir == "desc" { return q.order_desc(column) }
+        return q.order(column)
+    }
+    if not ident_ok(key) { return q }
+    let spec = try pair_split(value, ".")
+    let op = spec.get("head") otherwise ""
+    let rest = spec.get("tail") otherwise ""
+    if op == "eq" { return q.equals(key, rest) }
+    if op == "neq" { return q.differs(key, rest) }
+    if op == "gt" { return q.above(key, rest) }
+    if op == "gte" { return q.at_least(key, rest) }
+    if op == "lt" { return q.below(key, rest) }
+    if op == "lte" { return q.at_most(key, rest) }
+    if op == "like" { return q.like(key, rest) }
+    if op == "is" { return q.equals(key, "") }
+    return q
+}
+
+to apply_rest_query(q: Query, raw: Text) returns Query or fails RigError {
+    if raw.is_empty { return q }
+    let parts = try pair_split(raw, "&")
+    let next = try apply_rest_pair(q, parts.get("head") otherwise "")
+    return try apply_rest_query(next, parts.get("tail") otherwise "")
 }
 
 to apply_sort(q: Query, sort: {Text: Text}) returns Query {
@@ -2276,6 +2383,116 @@ to delete_object(db: Db, body: StudioObjectDelete) returns Int or fails RigError
     fail RigError.BadRequest("id or bucket_id+name required")
 }
 
+to decode_stored(content: Text) returns Text or fails RigError {
+    if content.is_empty { return "" }
+    match Bytes.from_base64(content) {
+        when success raw then {
+            let db = try memory_db()
+            let hex = raw.to_hex()
+            let decoded = try query_args(db, "select cast(x'{hex}' as text) as r", [])
+            if decoded.is_empty { return content }
+            return decoded[0].get("r") otherwise content
+        }
+        when failure _ then { return content }
+    }
+}
+
+to find_object(db: Db, bucket: Text, name: Text) returns {Text: Text} or fails RigError {
+    if bucket.is_empty or name.is_empty { fail RigError.BadRequest("bucket and name required") }
+    match db.from("studio_objects").equals("bucket_id", bucket).equals("name", name).first() {
+        when success maybe then match maybe {
+            when found row then { return row }
+            when nothing then { fail RigError.NotFound(name) }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to object_payload(db: Db, bucket: Text, name: Text) returns StoredBytes or fails RigError {
+    let row = try find_object(db, bucket, name)
+    let mime = nonempty(row.get("mime_type") otherwise "", "text/plain")
+    let body = try decode_stored(row.get("content") otherwise "")
+    return StoredBytes.new(body: body, mime: mime)
+}
+
+to bucket_is_public(db: Db, bucket: Text) returns Bool or fails RigError {
+    match db.from("studio_buckets").equals("id", bucket).first() {
+        when success maybe then match maybe {
+            when nothing then { return no }
+            when found row then {
+                let flag = row.get("public") otherwise ""
+                return flag == "true" or flag == "1" or flag == "yes"
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to sign_mac(bucket: Text, name: Text, exp: Text) returns Text or fails RigError {
+    let secret = try auth_secret()
+    let mac = try mac_hex(secret, "{bucket}/{name}.{exp}")
+    let db = try memory_db()
+    let rows = try query_args(db, "select substr(?1, 1, 32) as r", [mac])
+    if rows.is_empty { fail RigError.BadRequest("sign failed") }
+    return rows[0].get("r") otherwise ""
+}
+
+to sign_object(db: Db, body: StudioSignBody) returns StudioSignResult or fails RigError {
+    let _row = try find_object(db, body.bucket, body.name)
+    let seconds = if body.expires_in.is_empty { 3600 } else {
+        match from_json(body.expires_in, as: Int) {
+            when success n then { n }
+            when failure _ then { 3600 }
+        }
+    }
+    let exp = now() + seconds.max(1)
+    let sig = try sign_mac(body.bucket, body.name, "{exp}")
+    return StudioSignResult.new(url: "/storage/v1/object/sign/{body.bucket}/{exp}/{sig}/{body.name}", expires_at: "{exp}")
+}
+
+to public_object(db: Db, bucket: Text, name: Text) returns StoredBytes or fails RigError {
+    if not try bucket_is_public(db, bucket) { fail RigError.Forbidden("private bucket") }
+    return try object_payload(db, bucket, name)
+}
+
+to signed_object(db: Db, bucket: Text, exp: Text, sig: Text, name: Text) returns StoredBytes or fails RigError {
+    match from_json(exp, as: Int) {
+        when failure _ then { fail RigError.BadRequest("bad expiry") }
+        when success n then {
+            if n < now() { fail RigError.Forbidden("expired") }
+        }
+    }
+    let expect = try sign_mac(bucket, name, exp)
+    if expect != sig { fail RigError.Forbidden("bad signature") }
+    return try object_payload(db, bucket, name)
+}
+
+to invoke_stored(db: Db, slug: Text, authorization: Text) returns Text or fails RigError {
+    if slug.is_empty { fail RigError.BadRequest("slug required") }
+    match db.from("studio_functions").equals("slug", slug).first() {
+        when success maybe then match maybe {
+            when nothing then { fail RigError.NotFound(slug) }
+            when found row then {
+                let verify = row.get("verify_jwt") otherwise ""
+                if verify == "true" or verify == "1" {
+                    let token = try bearer_token(authorization)
+                    if token.is_empty { fail RigError.Unauthorized }
+                    let _claims = try verify_jwt(token)
+                }
+                let _l = log_studio(db, "edge-functions", "info", "POST", "/functions/v1/{slug}", slug, "501", "0")
+                return "stored, not executed"
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
 to list_functions(db: Db) returns [{Text: Text}] or fails RigError {
     match db.from("studio_functions").order_desc("updated_at").all() {
         when success rows then { return rows }
@@ -2288,9 +2505,18 @@ to list_functions(db: Db) returns [{Text: Text}] or fails RigError {
 to save_function(db: Db, body: StudioFunctionBody) returns StudioFunctionResult or fails RigError {
     if body.invoke == "true" {
         let started = now()
-        let _l = log_studio(db, "edge-functions", "info", nonempty(body.method, "POST"), "/functions/v1/{body.slug}", body.body, "200", "1")
+        match db.from("studio_functions").equals("slug", body.slug).first() {
+            when success maybe then match maybe {
+                when nothing then { fail RigError.NotFound(body.slug) }
+                when found _ then {}
+            }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
         let elapsed = now() - started
-        return StudioFunctionResult.new(count: 0, invoked: yes, status: "200", body: "ok {body.slug}", duration_ms: "{elapsed}")
+        let _l = log_studio(db, "edge-functions", "info", nonempty(body.method, "POST"), "/functions/v1/{body.slug}", body.body, "501", "1")
+        return StudioFunctionResult.new(count: 0, invoked: yes, status: "501", body: "stored, not executed", duration_ms: "{elapsed}")
     }
     let id = nonempty(body.id, nonempty(body.slug, "fn-{now()}"))
     match db.from("studio_functions").equals("id", id).first() {
@@ -3302,11 +3528,28 @@ cast RigRoutes {
         return try list_studio_tables(db)
     }
 
-    factory list_table(table: Text, actor: Actor) returns [{Text: Text}] or fails RigError {
+    factory list_table(table: Text, actor: Actor, raw: Text) returns [{Text: Text}] or fails RigError {
         let db = try RigRoutes.db()
-        let rows = try list_as(db, table, actor)
-        let _l = log_studio(db, "api", "info", "GET", "/rest/v1/{table}", "select {table}", "200", "0")
-        return rows
+        let name = try allow_studio_table(db, table)
+        let pk = primary_key(db, name)
+        let mode = try rls_mode(db, name, "select", actor)
+        if mode.kind == "deny" { return [] }
+        if mode.kind == "uid" and actor.uid.is_empty { return [] }
+        let base = db.from(name)
+        let scoped = if mode.kind == "uid" { base.equals(mode.column, actor.uid) } else { base }
+        let filtered = try apply_rest_query(scoped, raw)
+        let ordered = if raw.contains("order=") { filtered } else { filtered.order_desc(pk) }
+        let limit = clamp_limit(try rest_number(raw, "limit", 100))
+        let offset = (try rest_number(raw, "offset", 0)).max(0)
+        match ordered.limit(limit).offset(offset).all() {
+            when success rows then {
+                let _l = log_studio(db, "api", "info", "GET", "/rest/v1/{table}", "select {table}", "200", "0")
+                return rows
+            }
+            when failure error then match error {
+                when Failed(message) then { fail RigError.Database(message) }
+            }
+        }
     }
 
     factory get_table_row(table: Text, id: Text, actor: Actor) returns {Text: Text} or fails RigError {
@@ -3350,6 +3593,26 @@ cast RigRoutes {
     factory storage_file(filepath: Text) returns Text or fails RigError {
         let client = try RigRoutes.client()
         return try resolve_object(client.storage_root, filepath)
+    }
+
+    factory public_file(bucket: Text, name: Text) returns StoredBytes or fails RigError {
+        let db = try RigRoutes.db()
+        return try public_object(db, bucket, name)
+    }
+
+    factory signed_file(bucket: Text, exp: Text, sig: Text, name: Text) returns StoredBytes or fails RigError {
+        let db = try RigRoutes.db()
+        return try signed_object(db, bucket, exp, sig, name)
+    }
+
+    factory object_sign(body: StudioSignBody) returns StudioSignResult or fails RigError {
+        let db = try RigRoutes.db()
+        return try sign_object(db, body)
+    }
+
+    factory function_invoke(slug: Text, authorization: Text) returns Text or fails RigError {
+        let db = try RigRoutes.db()
+        return try invoke_stored(db, slug, authorization)
     }
 
     factory storage_listing() returns StudioStorage or fails RigError {
@@ -3673,7 +3936,7 @@ mount rig_api at "/rest/v1" {
 
     route get "/{table: Text}" {
         match rest_actor(request.headers) {
-            when success actor then match RigRoutes.list_table(table, actor) {
+            when success actor then match RigRoutes.list_table(table, actor, request.headers.get("x-rig-query") otherwise "") {
                 when success rows then { reply with rows }
                 when failure error then { reply text explain(error) as "text/plain" status 400 }
             }
@@ -3735,6 +3998,24 @@ mount rig_api at "/rest/v1" {
 }
 
 mount rig_storage at "/storage/v1" {
+    route get "/object/public/{bucket: Text}/{*name}" {
+        match RigRoutes.public_file(bucket, name) {
+            when success stored then { reply text stored.body as stored.mime }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status http_status(error)
+            }
+        }
+    }
+
+    route get "/object/sign/{bucket: Text}/{exp: Text}/{sig: Text}/{*name}" {
+        match RigRoutes.signed_file(bucket, exp, sig, name) {
+            when success stored then { reply text stored.body as stored.mime }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status http_status(error)
+            }
+        }
+    }
+
     route get "/object/{*filepath}" {
         match RigRoutes.storage_file(filepath) {
             when success target then {
@@ -4141,6 +4422,20 @@ mount rig_studio_api at "/studio-api" {
         }
     }
 
+    route post "/storage/sign" expecting StudioSignBody as body {
+        match authorize_studio(default_studio(), request.headers) {
+            when success _ then match RigRoutes.object_sign(body) {
+                when success signed then { reply with signed }
+                when failure error then {
+                    reply text explain(error) as "text/plain; charset=utf-8" status http_status(error)
+                }
+            }
+            when failure _ then {
+                reply text "unauthorized" as "text/plain" status 401
+            }
+        }
+    }
+
     route post "/storage/objects" expecting StudioObjectBody as body {
         match authorize_studio(default_studio(), request.headers) {
             when success _ then match RigRoutes.object_save(body) {
@@ -4331,11 +4626,23 @@ mount rig_studio at "/studio" {
     }
 }
 
+mount rig_functions at "/functions/v1" {
+    route post "/{slug: Text}" {
+        match RigRoutes.function_invoke(slug, request.headers.get("authorization") otherwise "") {
+            when success message then { reply text message as "text/plain" status 501 }
+            when failure error then {
+                reply text explain(error) as "text/plain; charset=utf-8" status http_status(error)
+            }
+        }
+    }
+}
+
 mount rig_riff at "" {
     mount rig_registry at "/api"
     mount rig_auth at "/auth/v1"
     mount rig_api at "/rest/v1"
     mount rig_storage at "/storage/v1"
+    mount rig_functions at "/functions/v1"
     mount rig_studio at "/studio"
 
     route get "/health" {
@@ -4374,6 +4681,7 @@ mount rig {
     mount rig_auth
     mount rig_api
     mount rig_storage
+    mount rig_functions
     mount rig_studio
 }
 
@@ -4381,5 +4689,6 @@ mount rig_all {
     mount rig_auth
     mount rig_api
     mount rig_storage
+    mount rig_functions
     mount rig_studio
 }

@@ -32,7 +32,7 @@ import {
   readFileAsBase64,
   saveBucket,
   saveObject,
-  signedObjectUrl,
+  createSignedObjectUrl,
   type StorageBucket,
   type StorageObject,
 } from '@/lib/storage-api'
@@ -670,7 +670,16 @@ function ObjectPreview({
         <Button type="button" variant="outline" size="sm" onClick={() => onCopy(publicObjectUrl(bucketId, object.name))}>
           Get public URL
         </Button>
-        <Button type="button" variant="outline" size="sm" onClick={() => onCopy(signedObjectUrl(bucketId, object.name, expiry))}>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            void createSignedObjectUrl(bucketId, object.name, expiry)
+              .then(onCopy)
+              .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Sign failed'))
+          }}
+        >
           Create signed URL
         </Button>
         <Button

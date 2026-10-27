@@ -132,7 +132,7 @@ export function FunctionsPage() {
       <div className="border-b border-border px-4 py-3 md:px-6">
         <PageHeader
           title="Edge Functions"
-          detail="Deploy and invoke functions on this gateway."
+          detail="Source is stored on this gateway. Invoke does not run it."
           actions={
             <Button type="button" onClick={() => setCreateOpen(true)}>
               New function

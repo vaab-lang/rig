@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -50,6 +50,11 @@ export function RealtimePage() {
   )
 }
 
+function realtimeSocketUrl() {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${window.location.host}/realtime/v1/websocket`
+}
+
 function RealtimeInspector() {
   const role = useRoleStore((state) => state.role)
   const tables = useQuery({ queryKey: ['studio', 'tables', role], queryFn: () => fetchStudioTables(role) })
@@ -58,10 +63,35 @@ function RealtimeInspector() {
   const [payload, setPayload] = useState('{"event":"ping"}')
   const [listenTable, setListenTable] = useState('')
   const [events, setEvents] = useState<RealtimeEvent[]>([])
+  const socketRef = useRef<WebSocket | null>(null)
 
   function push(type: string, next: string) {
     setEvents((current) => [{ ts: new Date().toISOString(), type, payload: next }, ...current].slice(0, 50))
   }
+
+  useEffect(() => {
+    if (!joined) {
+      socketRef.current?.close()
+      socketRef.current = null
+      return
+    }
+    const socket = new WebSocket(realtimeSocketUrl())
+    socketRef.current = socket
+    socket.onmessage = (event) => {
+      setEvents((current) =>
+        [{ ts: new Date().toISOString(), type: 'message', payload: String(event.data) }, ...current].slice(0, 50),
+      )
+    }
+    socket.onerror = () => {
+      setEvents((current) =>
+        [{ ts: new Date().toISOString(), type: 'error', payload: 'socket error' }, ...current].slice(0, 50),
+      )
+    }
+    return () => {
+      socket.close()
+      if (socketRef.current === socket) socketRef.current = null
+    }
+  }, [joined])
 
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
@@ -89,7 +119,10 @@ function RealtimeInspector() {
           <Button
             type="button"
             disabled={!joined}
-            onClick={() => push('broadcast', payload)}
+            onClick={() => {
+              socketRef.current?.send(payload)
+              push('broadcast', payload)
+            }}
           >
             Send
           </Button>

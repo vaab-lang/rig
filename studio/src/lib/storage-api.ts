@@ -190,9 +190,13 @@ export function publicObjectUrl(bucketId: string, name: string): string {
     .join('/')}`
 }
 
-export function signedObjectUrl(bucketId: string, name: string, expiresIn: number): string {
-  const path = name.split('/').map(encodeURIComponent).join('/')
-  return `${origin()}/storage/v1/object/sign/${encodeURIComponent(bucketId)}/${path}?expires=${expiresIn}`
+export async function createSignedObjectUrl(bucketId: string, name: string, expiresIn: number): Promise<string> {
+  const data = await studioJson<{ url: string }>('/studio-api/storage/sign', {
+    method: 'POST',
+    body: JSON.stringify({ bucket: bucketId, name, expires_in: String(expiresIn) }),
+  })
+  if (data.url.startsWith('http')) return data.url
+  return `${origin()}${data.url}`
 }
 
 export function joinPath(...parts: string[]): string {
