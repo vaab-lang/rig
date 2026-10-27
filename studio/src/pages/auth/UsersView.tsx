@@ -5,7 +5,6 @@ import { toast } from 'sonner'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -30,7 +29,7 @@ import { ErrorRetry, MonacoPane, OfflineBanner, SurfacePage, useOnline } from '@
 
 const COLUMNS = ['id', 'email', 'phone', 'provider', 'created', 'last sign-in', 'banned'] as const
 
-function emptyUserBody(user: Partial<AuthUser>, action: AuthUserAction) {
+function emptyUserBody(user: Partial<AuthUser> & { password?: string }, action: AuthUserAction) {
   return {
     id: user.id ?? '',
     email: user.email ?? '',
@@ -39,6 +38,7 @@ function emptyUserBody(user: Partial<AuthUser>, action: AuthUserAction) {
     raw_user_meta_data: user.raw_user_meta_data ?? '{}',
     banned_until: user.banned_until ?? '',
     action,
+    password: user.password ?? '',
   }
 }
 
@@ -52,7 +52,6 @@ export function UsersView() {
   const [dialog, setDialog] = useState<'add' | 'invite' | 'reset' | 'delete' | null>(null)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [autoConfirm, setAutoConfirm] = useState(true)
   const [metadata, setMetadata] = useState('{}')
   const source = usersQuery.data?.source ?? 'auth'
   const profiles = source === 'profiles'
@@ -97,7 +96,6 @@ export function UsersView() {
   function openCreate(kind: 'add' | 'invite') {
     setEmail('')
     setPassword('')
-    setAutoConfirm(true)
     setDialog(kind)
   }
 
@@ -131,7 +129,7 @@ export function UsersView() {
       detail={
         profiles
           ? 'Profiles. Auth users later.'
-          : 'Search, invite, ban, and export project users.'
+          : 'Email users. Password is hashed. Invite and mail are not mounted.'
       }
       actions={
         <>
@@ -143,7 +141,7 @@ export function UsersView() {
             <Download className="size-4" />
             Export
           </Button>
-          <Button type="button" variant="outline" size="sm" disabled={!online || profiles} onClick={() => openCreate('invite')}>
+          <Button type="button" variant="outline" size="sm" disabled title="Invite is not mounted. Mail is not sent.">
             Invite user
           </Button>
           <Button type="button" size="sm" disabled={!online || profiles} onClick={() => openCreate('add')}>
@@ -304,9 +302,7 @@ export function UsersView() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{dialog === 'invite' ? 'Invite user' : 'Add user'}</DialogTitle>
-            <DialogDescription>
-              {dialog === 'invite' ? 'Sends an invite to this email.' : 'Creates an email user on this project.'}
-            </DialogDescription>
+            <DialogDescription>Creates an email user and stores a password hash. No mail is sent.</DialogDescription>
           </DialogHeader>
           <form
             className="grid gap-3"
@@ -316,10 +312,11 @@ export function UsersView() {
                 emptyUserBody(
                   {
                     email,
+                    password,
                     provider: 'email',
-                    raw_user_meta_data: JSON.stringify({ auto_confirm: autoConfirm }),
+                    raw_user_meta_data: '{}',
                   },
-                  dialog === 'invite' ? 'invite' : 'create',
+                  'create',
                 ),
               )
             }}
@@ -334,21 +331,17 @@ export function UsersView() {
                 <Input
                   id="new-password"
                   type="password"
+                  required
+                  minLength={6}
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
                   autoComplete="new-password"
                 />
               </div>
             ) : null}
-            {dialog === 'add' ? (
-              <label className="flex items-center gap-2 text-sm">
-                <Checkbox checked={autoConfirm} onCheckedChange={(value) => setAutoConfirm(value === true)} />
-                Auto-confirm
-              </label>
-            ) : null}
-            <p className="text-xs text-muted-foreground">Password is collected here. The gateway stores id, email, and provider.</p>
-            <Button type="submit" disabled={!online || mutateUser.isPending}>
-              {dialog === 'invite' ? 'Invite' : 'Save'}
+            <p className="text-xs text-muted-foreground">Confirm-email and invite are not enforced. The password is hashed with AUTH_SECRET.</p>
+            <Button type="submit" disabled={!online || mutateUser.isPending || !password}>
+              Save
             </Button>
           </form>
         </DialogContent>
@@ -358,14 +351,18 @@ export function UsersView() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Reset password</DialogTitle>
-            <DialogDescription>Request a password reset for {selected?.email}.</DialogDescription>
+            <DialogDescription>Sets a new password hash for {selected?.email}. No email is sent.</DialogDescription>
           </DialogHeader>
           <div className="grid gap-3">
             <div className="grid gap-1.5">
               <Label htmlFor="reset-password">New password</Label>
               <Input id="reset-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
             </div>
-            <Button type="button" disabled={!online || !selected || mutateUser.isPending} onClick={() => applyAction('reset_password')}>
+            <Button
+              type="button"
+              disabled={!online || !selected || !password || mutateUser.isPending}
+              onClick={() => selected && mutateUser.mutate(emptyUserBody({ ...selected, password }, 'reset_password'))}
+            >
               Reset password
             </Button>
           </div>

@@ -45,6 +45,50 @@ type UserView {
     email: Text
 }
 
+type Actor {
+    role: Text
+    uid: Text
+}
+
+type RlsMode {
+    kind: Text
+    column: Text
+}
+
+type AuthSignupBody {
+    email: Text
+    password: Text
+}
+
+type AuthTokenBody {
+    grant_type: Text = "password"
+    email: Text = ""
+    password: Text = ""
+    refresh_token: Text = ""
+}
+
+type AuthUserResponse {
+    id: Text
+    email: Text
+    role: Text
+}
+
+type AuthSession {
+    access_token: Text
+    refresh_token: Text
+    token_type: Text
+    expires_in: Int
+    user: AuthUserResponse
+}
+
+type JwtClaims {
+    role: Text
+    sub: Text
+    email: Text
+    exp: Int
+    iat: Int
+}
+
 type OkCount {
     count: Int
 }
@@ -132,8 +176,21 @@ to exec_sql(db: Db, sql: Text) returns Int or fails RigError {
 
 to query_sql(db: Db, sql: Text) returns [{Text: Text}] or fails RigError {
     let empty: [Text] = []
-    match db.query(sql, empty) {
+    return try query_args(db, sql, empty)
+}
+
+to query_args(db: Db, sql: Text, args: [Text]) returns [{Text: Text}] or fails RigError {
+    match db.query(sql, args) {
         when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to exec_args(db: Db, sql: Text, args: [Text]) returns Int or fails RigError {
+    match db.execute(sql, args) {
+        when success count then { return count }
         when failure error then match error {
             when Failed(message) then { fail RigError.Database(message) }
         }
@@ -207,6 +264,8 @@ to is_sqlite_name(name: Text) returns Bool {
 
 to is_credential_table(name: Text) returns Bool {
     if name == "studio_config" { return yes }
+    if name == "auth_passwords" { return yes }
+    if name == "auth_refresh_tokens" { return yes }
     return no
 }
 
@@ -239,9 +298,16 @@ to drop_legacy_todos_table(db: Db) returns Int {
     }
 }
 
+to migrate_auth(db: Db) returns Int or fails RigError {
+    let _tokens = try exec_sql(db, "create table if not exists auth_refresh_tokens (id text primary key, user_id text not null, token_hash text not null, expires_at text not null)")
+    let _passwords = try exec_sql(db, "create table if not exists auth_passwords (user_id text primary key, password_hash text not null)")
+    return _passwords + _tokens
+}
+
 to ensure_schema(db: Db) returns Int or fails RigError {
     if schema_is_ready(db) {
-        return 1
+        let _m = try migrate_auth(db)
+        return _m
     }
     let _legacy = drop_legacy_todos_table(db)
     let _p = try exec_sql(db, "create table if not exists profiles (id text primary key, email text not null, name text not null default '')")
@@ -260,7 +326,8 @@ to ensure_schema(db: Db) returns Int or fails RigError {
     let _w = try exec_sql(db, "create table if not exists studio_webhooks (id text primary key, name text not null, table_name text not null, events text not null default '', url text not null, method text not null default 'POST', headers text not null default '', enabled text not null default 'true', created_at text not null)")
     let _seeded = try seed_studio(db)
     let _ready = try config_set(db, "schema_ready_v2", "1")
-    return _seeded
+    let _m = try migrate_auth(db)
+    return _seeded + _m
 }
 
 to seed_studio(db: Db) returns Int or fails RigError {
@@ -494,8 +561,8 @@ to is_postgres() returns Bool {
 }
 
 to catalog_table_rows(db: Db) returns [{Text: Text}] or fails RigError {
-    let pg_sql = "select cast(table_name as text) as name, case when table_type = 'VIEW' then 'view' else 'table' end as type, '' as sql from information_schema.tables where table_schema = 'public' and table_name != 'studio_config' order by table_name"
-    let sqlite_sql = "select name, type, coalesce(sql, '') as sql from sqlite_master where type in ('table', 'view') and name not like 'sqlite_%' and name != 'studio_config' order by name"
+    let pg_sql = "select cast(table_name as text) as name, case when table_type = 'VIEW' then 'view' else 'table' end as type, '' as sql from information_schema.tables where table_schema = 'public' and table_name != 'studio_config' and table_name != 'auth_passwords' and table_name != 'auth_refresh_tokens' order by table_name"
+    let sqlite_sql = "select name, type, coalesce(sql, '') as sql from sqlite_master where type in ('table', 'view') and name not like 'sqlite_%' and name != 'studio_config' and name != 'auth_passwords' and name != 'auth_refresh_tokens' order by name"
     if is_postgres() {
         return try query_sql(db, pg_sql)
     }
@@ -588,6 +655,51 @@ to list(db: Db, table: Text) returns [{Text: Text}] or fails RigError {
             when Failed(message) then { fail RigError.Database(message) }
         }
     }
+}
+
+to list_as(db: Db, table: Text, actor: Actor) returns [{Text: Text}] or fails RigError {
+    let name = try allow_studio_table(db, table)
+    let mode = try rls_mode(db, name, "select", actor)
+    if mode.kind == "deny" or (mode.kind == "uid" and actor.uid.is_empty) {
+        return empty_rows()
+    }
+    let pk = primary_key(db, name)
+    let scoped = if mode.kind == "uid" {
+        db.from(name).equals(mode.column, actor.uid).order_desc(pk)
+    } else {
+        db.from(name).order_desc(pk)
+    }
+    match scoped.all() {
+        when success rows then { return rows }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to get_as(db: Db, table: Text, id: Text, actor: Actor) returns {Text: Text} or fails RigError {
+    let name = try allow_studio_table(db, table)
+    let _ok = try assert_existing(db, name, "select", actor, id)
+    return try get(db, name, id)
+}
+
+to insert_row_as(db: Db, table: Text, values: {Text: Text}, actor: Actor) returns Int or fails RigError {
+    let name = try allow_studio_table(db, table)
+    let _ok = try assert_values(db, name, "insert", actor, values, yes)
+    return try insert_row(db, name, values)
+}
+
+to patch_row_as(db: Db, table: Text, id: Text, values: {Text: Text}, actor: Actor) returns Int or fails RigError {
+    let name = try allow_studio_table(db, table)
+    let _existing = try assert_existing(db, name, "update", actor, id)
+    let _next = try assert_values(db, name, "update", actor, values, no)
+    return try patch_row(db, name, id, values)
+}
+
+to remove_as(db: Db, table: Text, id: Text, actor: Actor) returns Int or fails RigError {
+    let name = try allow_studio_table(db, table)
+    let _ok = try assert_existing(db, name, "delete", actor, id)
+    return try remove(db, name, id)
 }
 
 to list_where(db: Db, table: Text, column: Text, value: Text) returns [{Text: Text}] or fails RigError {
@@ -963,6 +1075,7 @@ type StudioAuthUserBody {
     raw_user_meta_data: Text
     banned_until: Text
     action: Text
+    password: Text = ""
 }
 
 type StudioPolicyBody {
@@ -1266,12 +1379,17 @@ to insert_studio_row(db: Db, body: StudioInsertBody) returns Int or fails RigErr
     }
 }
 
-to patch_studio_row(db: Db, body: StudioPatchBody) returns Int or fails RigError {
+to patch_studio_row(db: Db, body: StudioPatchBody, actor: Actor) returns Int or fails RigError {
     let table = try allow_studio_table(db, body.table)
     if body.id.is_empty {
         fail RigError.BadRequest("id required")
     }
     let col = try ident(body.column)
+    let _existing = try assert_existing(db, table, "update", actor, body.id)
+    let mode = try rls_mode(db, table, "update", actor)
+    if mode.kind == "uid" and col == mode.column and body.value != actor.uid {
+        fail RigError.Forbidden(table)
+    }
     let pk = primary_key(db, table)
     match db.from(table).equals(pk, body.id).update({col: body.value}) {
         when success count then {
@@ -1588,9 +1706,94 @@ to clamp_limit(n: Int) returns Int {
     return n
 }
 
-to query_studio_rows(db: Db, body: StudioRowQuery) returns StudioRowPage or fails RigError {
+to policy_role_ok(roles: Text, role: Text) returns Bool {
+    let lowered = roles.lower()
+    if lowered.is_empty { return yes }
+    if lowered == "public" { return yes }
+    if lowered.contains(role) { return yes }
+    return no
+}
+
+to policy_command_ok(command_name: Text, command: Text) returns Bool {
+    let lowered = command_name.lower()
+    if lowered.is_empty { return yes }
+    if lowered == "all" { return yes }
+    if lowered == "*" { return yes }
+    if lowered == command { return yes }
+    return no
+}
+
+to rls_enforced(db: Db, table_name: Text) returns Bool {
+    let flag = rls_flag(db, table_name)
+    if flag == "true" { return yes }
+    if flag == "1" { return yes }
+    match db.from("studio_policies").equals("table_name", table_name).count() {
+        when success n then { return n > 0 }
+        when failure _ then { return no }
+    }
+}
+
+to uid_column(db: Db, definition: Text) returns Text or fails RigError {
+    if not definition.lower().contains("auth.uid()") { return "" }
+    let rows = try query_args(db, "select trim(replace(replace(replace(lower(?1), 'auth.uid()', ''), '=', ''), ' ', '')) as r", [definition])
+    if rows.is_empty { return "" }
+    let column = rows[0].get("r") otherwise ""
+    if ident_ok(column) { return column }
+    return ""
+}
+
+to fold_policies(db: Db, rows: [{Text: Text}], command: Text, role: Text, i: Int, kind: Text, column: Text) returns RlsMode or fails RigError {
+    if i >= rows.count {
+        return RlsMode.new(kind: kind, column: column)
+    }
+    let row = rows[i]
+    let action = row_text(row, "action").lower()
+    if action == "restrictive" {
+        return try fold_policies(db, rows, command, role, i + 1, kind, column)
+    }
+    if not policy_command_ok(row_text(row, "command"), command) {
+        return try fold_policies(db, rows, command, role, i + 1, kind, column)
+    }
+    if not policy_role_ok(row_text(row, "roles"), role) {
+        return try fold_policies(db, rows, command, role, i + 1, kind, column)
+    }
+    let definition = row_text(row, "definition").lower()
+    if definition == "true" or definition == "(true)" {
+        return RlsMode.new(kind: "open", column: "")
+    }
+    let column_name = try uid_column(db, definition)
+    if not column_name.is_empty {
+        if kind == "uid" and column != column_name {
+            return try fold_policies(db, rows, command, role, i + 1, kind, column)
+        }
+        return try fold_policies(db, rows, command, role, i + 1, "uid", column_name)
+    }
+    return try fold_policies(db, rows, command, role, i + 1, kind, column)
+}
+
+to rls_mode(db: Db, table_name: Text, command: Text, actor: Actor) returns RlsMode or fails RigError {
+    if actor.role == "postgres" {
+        return RlsMode.new(kind: "open", column: "")
+    }
+    if not rls_enforced(db, table_name) {
+        return RlsMode.new(kind: "open", column: "")
+    }
+    match db.from("studio_policies").equals("table_name", table_name).all() {
+        when success rows then { return try fold_policies(db, rows, command, actor.role, 0, "deny", "") }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to query_studio_rows(db: Db, body: StudioRowQuery, actor: Actor) returns StudioRowPage or fails RigError {
     let table = try allow_user_table(body.table)
-    let filtered = apply_filters(db.from(table), body.filters, 0)
+    let mode = try rls_mode(db, table, "select", actor)
+    if mode.kind == "deny" or (mode.kind == "uid" and actor.uid.is_empty) {
+        return StudioRowPage.new(rows: empty_rows(), count: 0)
+    }
+    let base = if mode.kind == "uid" { db.from(table).equals(mode.column, actor.uid) } else { db.from(table) }
+    let filtered = apply_filters(base, body.filters, 0)
     match filtered.count() {
         when success total then {
             let sorted = apply_sorts(filtered, body.sorts, 0)
@@ -1609,7 +1812,34 @@ to query_studio_rows(db: Db, body: StudioRowQuery) returns StudioRowPage or fail
     }
 }
 
-to insert_studio_values(db: Db, body: StudioRowWrite) returns Int or fails RigError {
+to assert_values(db: Db, table: Text, command: Text, actor: Actor, values: {Text: Text}, strict: Bool) returns Int or fails RigError {
+    let mode = try rls_mode(db, table, command, actor)
+    if mode.kind == "open" { return 1 }
+    if mode.kind == "uid" and not actor.uid.is_empty {
+        match values.get(mode.column) {
+            when found value then {
+                if value == actor.uid { return 1 }
+            }
+            when nothing then {
+                if not strict { return 1 }
+            }
+        }
+    }
+    fail RigError.Forbidden(table)
+}
+
+to assert_existing(db: Db, table: Text, command: Text, actor: Actor, id: Text) returns Int or fails RigError {
+    let mode = try rls_mode(db, table, command, actor)
+    if mode.kind == "open" { return 1 }
+    if mode.kind == "uid" and not actor.uid.is_empty {
+        let row = try get(db, table, id)
+        let value = row.get(mode.column) otherwise ""
+        if value == actor.uid { return 1 }
+    }
+    fail RigError.Forbidden(table)
+}
+
+to insert_studio_values(db: Db, body: StudioRowWrite, actor: Actor) returns Int or fails RigError {
     let table = try allow_user_table(body.table)
     if body.values.is_empty {
         fail RigError.BadRequest("values required")
@@ -1617,6 +1847,7 @@ to insert_studio_values(db: Db, body: StudioRowWrite) returns Int or fails RigEr
     if not values_ok(body.values) {
         fail RigError.BadRequest("bad column name")
     }
+    let _ok = try assert_values(db, table, "insert", actor, body.values, yes)
     match db.from(table).insert(body.values) {
         when success count then { return count }
         when failure error then match error {
@@ -1625,7 +1856,7 @@ to insert_studio_values(db: Db, body: StudioRowWrite) returns Int or fails RigEr
     }
 }
 
-to patch_studio_values(db: Db, body: StudioRowWrite) returns Int or fails RigError {
+to patch_studio_values(db: Db, body: StudioRowWrite, actor: Actor) returns Int or fails RigError {
     let table = try allow_user_table(body.table)
     if body.id.is_empty {
         fail RigError.BadRequest("id required")
@@ -1636,6 +1867,8 @@ to patch_studio_values(db: Db, body: StudioRowWrite) returns Int or fails RigErr
     if not values_ok(body.values) {
         fail RigError.BadRequest("bad column name")
     }
+    let _existing = try assert_existing(db, table, "update", actor, body.id)
+    let _next = try assert_values(db, table, "update", actor, body.values, no)
     let pk = primary_key(db, table)
     match db.from(table).equals(pk, body.id).update(body.values) {
         when success count then {
@@ -1648,7 +1881,8 @@ to patch_studio_values(db: Db, body: StudioRowWrite) returns Int or fails RigErr
     }
 }
 
-to delete_one_id(db: Db, table: Text, pk: Text, id: Text) returns Int or fails RigError {
+to delete_one_id(db: Db, table: Text, pk: Text, id: Text, actor: Actor) returns Int or fails RigError {
+    let _ok = try assert_existing(db, table, "delete", actor, id)
     match db.from(table).equals(pk, id).delete() {
         when success count then { return count }
         when failure error then match error {
@@ -1657,16 +1891,16 @@ to delete_one_id(db: Db, table: Text, pk: Text, id: Text) returns Int or fails R
     }
 }
 
-to delete_studio_ids_at(db: Db, table: Text, pk: Text, ids: [Text], i: Int) returns Int or fails RigError {
+to delete_studio_ids_at(db: Db, table: Text, pk: Text, ids: [Text], actor: Actor, i: Int) returns Int or fails RigError {
     if i >= ids.count { return 0 }
-    let n = try delete_one_id(db, table, pk, ids[i])
-    return n + try delete_studio_ids_at(db, table, pk, ids, i + 1)
+    let n = try delete_one_id(db, table, pk, ids[i], actor)
+    return n + try delete_studio_ids_at(db, table, pk, ids, actor, i + 1)
 }
 
-to delete_studio_ids(db: Db, body: StudioRowDelete) returns Int or fails RigError {
+to delete_studio_ids(db: Db, body: StudioRowDelete, actor: Actor) returns Int or fails RigError {
     let table = try allow_user_table(body.table)
     let pk = primary_key(db, table)
-    return try delete_studio_ids_at(db, table, pk, body.ids, 0)
+    return try delete_studio_ids_at(db, table, pk, body.ids, actor, 0)
 }
 
 to list_snippets(db: Db) returns [{Text: Text}] or fails RigError {
@@ -1744,6 +1978,14 @@ to save_auth_user(db: Db, body: StudioAuthUserBody) returns Int or fails RigErro
     if id.is_empty {
         fail RigError.BadRequest("id or email required")
     }
+    if body.action == "invite" {
+        fail RigError.BadRequest("invite is not mounted")
+    }
+    if body.action == "create" or body.action == "reset_password" {
+        if body.password.is_empty {
+            fail RigError.BadRequest("password required")
+        }
+    }
     if body.action == "ban" {
         match db.from("auth_users").equals("id", id).update({"banned_until": nonempty(body.banned_until, "{now()}")}) {
             when success count then { return count }
@@ -1769,7 +2011,10 @@ to save_auth_user(db: Db, body: StudioAuthUserBody) returns Int or fails RigErro
                 "raw_user_meta_data": nonempty(body.raw_user_meta_data, ""),
                 "banned_until": body.banned_until,
             }) {
-                when success count then { return count }
+                when success count then {
+                    let _p = try store_password(db, id, body.password)
+                    return count + _p - _p
+                }
                 when failure error then match error {
                     when Failed(message) then { fail RigError.Database(message) }
                 }
@@ -1788,13 +2033,25 @@ to save_auth_user(db: Db, body: StudioAuthUserBody) returns Int or fails RigErro
                     when success count then {
                         match db.from("profiles").equals("id", id).first() {
                             when success existing then match existing {
-                                when found _ then { return count }
+                                when found _ then {
+                                    let _p = try store_password(db, id, body.password)
+                                    return count
+                                }
                                 when nothing then match db.from("profiles").insert({"id": id, "email": body.email, "name": ""}) {
-                                    when success _ then { return count }
-                                    when failure _ then { return count }
+                                    when success _ then {
+                                        let _p = try store_password(db, id, body.password)
+                                        return count
+                                    }
+                                    when failure _ then {
+                                        let _p = try store_password(db, id, body.password)
+                                        return count
+                                    }
                                 }
                             }
-                            when failure _ then { return count }
+                            when failure _ then {
+                                let _p = try store_password(db, id, body.password)
+                                return count
+                            }
                         }
                     }
                     when failure error then match error {
@@ -2330,6 +2587,702 @@ to explain(error: RigError) returns Text {
     }
 }
 
+to http_status(error: RigError) returns Int {
+    match error {
+        when Unauthorized then { return 401 }
+        when Forbidden(_) then { return 403 }
+        when NotFound(_) then { return 404 }
+        when BadRequest(_) then { return 400 }
+        when Missing(_) then { return 500 }
+        when Database(_) then { return 400 }
+        when Unsafe(_) then { return 400 }
+    }
+}
+
+# SHA-256 over UTF-8, using SQLite for 32-bit bitwise ops (Vaab has none).
+
+to sql_text(db: Db, sql: Text, args: [Text]) returns Text or fails DbError {
+    let rows = try db.query(sql, args)
+    if rows.is_empty {
+        fail DbError.Failed("empty")
+    }
+    return rows[0].get("r") otherwise ""
+}
+
+to sql_int(db: Db, sql: Text, args: [Text]) returns Int or fails DbError {
+    let text = try sql_text(db, sql, args)
+    match from_json(text, as: Int) {
+        when success n then { return n }
+        when failure _ then { fail DbError.Failed("bad int {text}") }
+    }
+}
+
+to rotr(db: Db, x: Int, n: Int) returns Int or fails DbError {
+    return try sql_int(db, "select (((?1 >> ?2) | ((?1 << (32 - ?2)) & 4294967295)) & 4294967295) as r", ["{x}", "{n}"])
+}
+
+to shr(db: Db, x: Int, n: Int) returns Int or fails DbError {
+    return try sql_int(db, "select (?1 >> ?2) as r", ["{x}", "{n}"])
+}
+
+to xor2(db: Db, a: Int, b: Int) returns Int or fails DbError {
+    return try sql_int(db, "select (((?1 | ?2) - (?1 & ?2)) & 4294967295) as r", ["{a}", "{b}"])
+}
+
+to band(db: Db, a: Int, b: Int) returns Int or fails DbError {
+    return try sql_int(db, "select (?1 & ?2) as r", ["{a}", "{b}"])
+}
+
+to add32(db: Db, a: Int, b: Int) returns Int or fails DbError {
+    return try sql_int(db, "select ((?1 + ?2) & 4294967295) as r", ["{a}", "{b}"])
+}
+
+to xor3(db: Db, a: Int, b: Int, c: Int) returns Int or fails DbError {
+    let ab = try xor2(db, a, b)
+    return try xor2(db, ab, c)
+}
+
+to ch(db: Db, e: Int, f: Int, g: Int) returns Int or fails DbError {
+    let ef = try band(db, e, f)
+    let not_e = 4294967295 - e
+    let ng = try band(db, not_e, g)
+    return try xor2(db, ef, ng)
+}
+
+to maj(db: Db, a: Int, b: Int, c: Int) returns Int or fails DbError {
+    let ab = try band(db, a, b)
+    let ac = try band(db, a, c)
+    let bc = try band(db, b, c)
+    return try xor3(db, ab, ac, bc)
+}
+
+to byte_at(db: Db, i: Int) returns Int or fails DbError {
+    return try sql_int(db, "select v as r from m where i = ?1", ["{i}"])
+}
+
+to wget(db: Db, i: Int) returns Int or fails DbError {
+    return try sql_int(db, "select v as r from w where i = ?1", ["{i}"])
+}
+
+to kget(db: Db, i: Int) returns Int or fails DbError {
+    return try sql_int(db, "select v as r from k where i = ?1", ["{i}"])
+}
+
+to put_w(db: Db, i: Int, v: Int) returns Int or fails DbError {
+    return try db.execute("insert into w(i, v) values (?1, ?2)", ["{i}", "{v}"])
+}
+
+to put_m(db: Db, i: Int, v: Int) returns Int or fails DbError {
+    return try db.execute("insert into m(i, v) values (?1, ?2)", ["{i}", "{v}"])
+}
+
+to sha256_hex(message: Text, raw_hex: Bool) returns Text or fails DbError {
+    let db = try Db.connect("sqlite::memory:")
+    let empty: [Text] = []
+    let _t1 = try db.execute("create table m(i integer primary key, v integer)", empty)
+    let _t2 = try db.execute("create table w(i integer primary key, v integer)", empty)
+    let _t3 = try db.execute("create table k(i integer primary key, v integer)", empty)
+    let _k = try db.execute("insert into k(i, v) values (0,1116352408),(1,1899447441),(2,3049323471),(3,3921009573),(4,961987163),(5,1508970993),(6,2453635748),(7,2870763221),(8,3624381080),(9,310598401),(10,607225278),(11,1426881987),(12,1925078388),(13,2162078206),(14,2614888103),(15,3248222580),(16,3835390401),(17,4022224774),(18,264347078),(19,604807628),(20,770255983),(21,1249150122),(22,1555081692),(23,1996064986),(24,2554220882),(25,2821834349),(26,2952996808),(27,3210313671),(28,3336571891),(29,3584528711),(30,113926993),(31,338241895),(32,666307205),(33,773529912),(34,1294757372),(35,1396182291),(36,1695183700),(37,1986661051),(38,2177026350),(39,2456956037),(40,2730485921),(41,2820302411),(42,3259730800),(43,3345764771),(44,3516065817),(45,3600352804),(46,4094571909),(47,275423344),(48,430227734),(49,506948616),(50,659060556),(51,883997877),(52,958139571),(53,1322822218),(54,1537002063),(55,1747873779),(56,1955562222),(57,2024104815),(58,2227730452),(59,2361852424),(60,2428436474),(61,2756734187),(62,3204031479),(63,3329325298)", empty)
+    let load_text = "insert into m(i, v) with recursive src(h) as (select hex(?1)), bytes(i, v) as (select 0, (instr('0123456789ABCDEF', substr(h, 1, 1)) - 1) * 16 + (instr('0123456789ABCDEF', substr(h, 2, 1)) - 1) from src where length(h) >= 2 union all select i + 1, (instr('0123456789ABCDEF', substr((select h from src), (i + 1) * 2 + 1, 1)) - 1) * 16 + (instr('0123456789ABCDEF', substr((select h from src), (i + 1) * 2 + 2, 1)) - 1) from bytes where (i + 1) * 2 < (select length(h) from src)) select i, v from bytes"
+    let load_hex = "insert into m(i, v) with recursive src(h) as (select upper(?1)), bytes(i, v) as (select 0, (instr('0123456789ABCDEF', substr(h, 1, 1)) - 1) * 16 + (instr('0123456789ABCDEF', substr(h, 2, 1)) - 1) from src where length(h) >= 2 union all select i + 1, (instr('0123456789ABCDEF', substr((select h from src), (i + 1) * 2 + 1, 1)) - 1) * 16 + (instr('0123456789ABCDEF', substr((select h from src), (i + 1) * 2 + 2, 1)) - 1) from bytes where (i + 1) * 2 < (select length(h) from src)) select i, v from bytes"
+    let load = if raw_hex { load_hex } else { load_text }
+    let _load = try db.execute(load, [message])
+    let n = try sql_int(db, "select count(*) as r from m", empty)
+    let bitlen = n * 8
+    let _pad = try put_m(db, n, 128)
+    let changing len = n + 1
+    while len % 64 != 56 {
+        let _z = try put_m(db, len, 0)
+        len = len + 1
+    }
+    let hi = bitlen / 4294967296
+    let lo = bitlen % 4294967296
+    let _a = try put_m(db, len, hi / 16777216)
+    let _b = try put_m(db, len + 1, (hi / 65536) % 256)
+    let _c = try put_m(db, len + 2, (hi / 256) % 256)
+    let _d = try put_m(db, len + 3, hi % 256)
+    let _e = try put_m(db, len + 4, lo / 16777216)
+    let _f = try put_m(db, len + 5, (lo / 65536) % 256)
+    let _g = try put_m(db, len + 6, (lo / 256) % 256)
+    let _h = try put_m(db, len + 7, lo % 256)
+    len = len + 8
+    let blocks = len / 64
+    let changing h0 = 1779033703
+    let changing h1 = 3144134277
+    let changing h2 = 1013904242
+    let changing h3 = 2773480762
+    let changing h4 = 1359893119
+    let changing h5 = 2600822924
+    let changing h6 = 528734635
+    let changing h7 = 1541459225
+    let changing block = 0
+    let changing i = 0
+    let changing b0 = 0
+    let changing b1 = 0
+    let changing b2 = 0
+    let changing b3 = 0
+    let changing word = 0
+    let changing s0 = 0
+    let changing s1 = 0
+    let changing w15 = 0
+    let changing w2 = 0
+    let changing w16 = 0
+    let changing w7 = 0
+    let changing a = 0
+    let changing b = 0
+    let changing c = 0
+    let changing d = 0
+    let changing e = 0
+    let changing f = 0
+    let changing g = 0
+    let changing h = 0
+    let changing r = 0
+    let changing kval = 0
+    let changing wval = 0
+    let changing chv = 0
+    let changing majv = 0
+    let changing t1 = 0
+    let changing t2 = 0
+    let changing base = 0
+    while block < blocks {
+        let _clr = try db.execute("delete from w", empty)
+        i = 0
+        while i < 16 {
+            base = block * 64 + i * 4
+            b0 = try byte_at(db, base)
+            b1 = try byte_at(db, base + 1)
+            b2 = try byte_at(db, base + 2)
+            b3 = try byte_at(db, base + 3)
+            word = b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+            let _pw = try put_w(db, i, word)
+            i = i + 1
+        }
+        while i < 64 {
+            w15 = try wget(db, i - 15)
+            w2 = try wget(db, i - 2)
+            w16 = try wget(db, i - 16)
+            w7 = try wget(db, i - 7)
+            s0 = try xor3(db, try rotr(db, w15, 7), try rotr(db, w15, 18), try shr(db, w15, 3))
+            s1 = try xor3(db, try rotr(db, w2, 17), try rotr(db, w2, 19), try shr(db, w2, 10))
+            word = try add32(db, try add32(db, try add32(db, w16, s0), w7), s1)
+            let _pw2 = try put_w(db, i, word)
+            i = i + 1
+        }
+        a = h0
+        b = h1
+        c = h2
+        d = h3
+        e = h4
+        f = h5
+        g = h6
+        h = h7
+        r = 0
+        while r < 64 {
+            kval = try kget(db, r)
+            wval = try wget(db, r)
+            s1 = try xor3(db, try rotr(db, e, 6), try rotr(db, e, 11), try rotr(db, e, 25))
+            chv = try ch(db, e, f, g)
+            t1 = try add32(db, try add32(db, try add32(db, try add32(db, h, s1), chv), kval), wval)
+            s0 = try xor3(db, try rotr(db, a, 2), try rotr(db, a, 13), try rotr(db, a, 22))
+            majv = try maj(db, a, b, c)
+            t2 = try add32(db, s0, majv)
+            h = g
+            g = f
+            f = e
+            e = try add32(db, d, t1)
+            d = c
+            c = b
+            b = a
+            a = try add32(db, t1, t2)
+            r = r + 1
+        }
+        h0 = try add32(db, h0, a)
+        h1 = try add32(db, h1, b)
+        h2 = try add32(db, h2, c)
+        h3 = try add32(db, h3, d)
+        h4 = try add32(db, h4, e)
+        h5 = try add32(db, h5, f)
+        h6 = try add32(db, h6, g)
+        h7 = try add32(db, h7, h)
+        block = block + 1
+    }
+    let p0 = try sql_text(db, "select printf('%08x', ?1) as r", ["{h0}"])
+    let p1 = try sql_text(db, "select printf('%08x', ?1) as r", ["{h1}"])
+    let p2 = try sql_text(db, "select printf('%08x', ?1) as r", ["{h2}"])
+    let p3 = try sql_text(db, "select printf('%08x', ?1) as r", ["{h3}"])
+    let p4 = try sql_text(db, "select printf('%08x', ?1) as r", ["{h4}"])
+    let p5 = try sql_text(db, "select printf('%08x', ?1) as r", ["{h5}"])
+    let p6 = try sql_text(db, "select printf('%08x', ?1) as r", ["{h6}"])
+    let p7 = try sql_text(db, "select printf('%08x', ?1) as r", ["{h7}"])
+    return "{p0}{p1}{p2}{p3}{p4}{p5}{p6}{p7}"
+}
+
+to hex_of(db: Db, text: Text) returns Text or fails DbError {
+    return try sql_text(db, "select hex(?1) as r", [text])
+}
+
+to xor_byte(db: Db, a: Int, b: Int) returns Int or fails DbError {
+    return try sql_int(db, "select ((?1 | ?2) - (?1 & ?2)) as r", ["{a}", "{b}"])
+}
+
+to hmac_sha256_hex(key: Text, message: Text) returns Text or fails DbError {
+    let db = try Db.connect("sqlite::memory:")
+    let empty: [Text] = []
+    let _t = try db.execute("create table kb(i integer primary key, v integer)", empty)
+    let load = "insert into kb(i, v) with recursive src(h) as (select hex(?1)), bytes(i, v) as (select 0, (instr('0123456789ABCDEF', substr(h, 1, 1)) - 1) * 16 + (instr('0123456789ABCDEF', substr(h, 2, 1)) - 1) from src where length(h) >= 2 union all select i + 1, (instr('0123456789ABCDEF', substr((select h from src), (i + 1) * 2 + 1, 1)) - 1) * 16 + (instr('0123456789ABCDEF', substr((select h from src), (i + 1) * 2 + 2, 1)) - 1) from bytes where (i + 1) * 2 < (select length(h) from src)) select i, v from bytes"
+    let _load = try db.execute(load, [key])
+    let key_len = try sql_int(db, "select count(*) as r from kb", empty)
+    let changing key_hex = ""
+    if key_len > 64 {
+        key_hex = try sha256_hex(key, no)
+    }
+    let changing i = 0
+    let changing ipad = ""
+    let changing opad = ""
+    let changing byte = 0
+    let changing ib = 0
+    let changing ob = 0
+    let changing pair = ""
+    while i < 64 {
+        byte = 0
+        if key_len > 64 {
+            if i < 32 {
+                pair = try sql_text(db, "select substr(?1, ?2, 2) as r", [key_hex, "{i * 2 + 1}"])
+                byte = try sql_int(db, "select ((instr('0123456789abcdef', substr(lower(?1), 1, 1)) - 1) * 16 + (instr('0123456789abcdef', substr(lower(?1), 2, 1)) - 1)) as r", [pair])
+            }
+        } else if i < key_len {
+            byte = try sql_int(db, "select v as r from kb where i = ?1", ["{i}"])
+        }
+        ib = try xor_byte(db, byte, 54)
+        ob = try xor_byte(db, byte, 92)
+        let ih = try sql_text(db, "select printf('%02x', ?1) as r", ["{ib}"])
+        let oh = try sql_text(db, "select printf('%02x', ?1) as r", ["{ob}"])
+        ipad = "{ipad}{ih}"
+        opad = "{opad}{oh}"
+        i = i + 1
+    }
+    let message_hex = try hex_of(db, message)
+    let inner = try sha256_hex("{ipad}{message_hex}", yes)
+    return try sha256_hex("{opad}{inner}", yes)
+}
+
+# --- passwords and JWT (HS256 via HMAC-SHA256) ---------------------------
+
+to lift_db(error: DbError) returns RigError {
+    match error {
+        when Failed(message) then { return RigError.Database(message) }
+    }
+}
+
+to digest_text(message: Text) returns Text or fails RigError {
+    match sha256_hex(message, no) {
+        when success value then { return value }
+        when failure error then { fail lift_db(error) }
+    }
+}
+
+to mac_hex(key: Text, message: Text) returns Text or fails RigError {
+    match hmac_sha256_hex(key, message) {
+        when success value then { return value }
+        when failure error then { fail lift_db(error) }
+    }
+}
+
+to memory_db() returns Db or fails RigError {
+    match Db.connect("sqlite::memory:") {
+        when success db then { return db }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to auth_secret() returns Text or fails RigError {
+    match env.get("AUTH_SECRET") {
+        when found value then {
+            if value.is_empty { fail RigError.Missing("AUTH_SECRET") }
+            return value
+        }
+        when nothing then { fail RigError.Missing("AUTH_SECRET") }
+    }
+}
+
+to anon_key() returns Text {
+    return env.get("RIG_ANON_KEY") otherwise "rig-anon-key"
+}
+
+to header_get(headers: {Text: Text}, name: Text) returns Text {
+    match headers.get(name) {
+        when found value then { return value }
+        when nothing then { return "" }
+    }
+}
+
+to bearer_token(header: Text) returns Text or fails RigError {
+    if header.is_empty { return "" }
+    let db = try memory_db()
+    let rows = try query_args(db, "select case when lower(substr(?1, 1, 7)) = 'bearer ' then trim(substr(?1, 8)) else '' end as r", [header])
+    if rows.is_empty { return "" }
+    return rows[0].get("r") otherwise ""
+}
+
+to b64url_hex(hex: Text) returns Text or fails RigError {
+    match Bytes.from_hex(hex) {
+        when success raw then {
+            let db = try memory_db()
+            let rows = try query_args(db, "select replace(replace(rtrim(?1, '='), '+', '-'), '/', '_') as r", [raw.to_base64()])
+            if rows.is_empty { return "" }
+            return rows[0].get("r") otherwise ""
+        }
+        when failure _ then { fail RigError.BadRequest("bad hex") }
+    }
+}
+
+to b64url_text(text: Text) returns Text or fails RigError {
+    let db = try memory_db()
+    let rows = try query_args(db, "select hex(?1) as r", [text])
+    if rows.is_empty { fail RigError.BadRequest("empty text") }
+    return try b64url_hex(rows[0].get("r") otherwise "")
+}
+
+to b64url_decode(text: Text) returns Text or fails RigError {
+    let db = try memory_db()
+    let standard_rows = try query_args(db, "select replace(replace(?1, '-', '+'), '_', '/') as r", [text])
+    if standard_rows.is_empty { fail RigError.BadRequest("bad token") }
+    let changing standard = standard_rows[0].get("r") otherwise ""
+    while standard.length % 4 != 0 {
+        standard = "{standard}="
+    }
+    match Bytes.from_base64(standard) {
+        when success raw then {
+            let hex = raw.to_hex()
+            let ok_rows = try query_args(db, "select case when ?1 glob '[0-9A-Fa-f]*' and (length(?1) % 2) = 0 then 'yes' else 'no' end as r", [hex])
+            let ok = ok_rows[0].get("r") otherwise "no"
+            if ok != "yes" { fail RigError.BadRequest("bad token") }
+            let decoded = try query_args(db, "select cast(x'{hex}' as text) as r", [])
+            if decoded.is_empty { fail RigError.BadRequest("bad token") }
+            return decoded[0].get("r") otherwise ""
+        }
+        when failure _ then { fail RigError.BadRequest("bad token") }
+    }
+}
+
+to jwt_seconds(db: Db) returns Int {
+    match config_get(db, "jwt_expiry") {
+        when success value then match from_json(value, as: Int) {
+            when success n then {
+                if n > 0 { return n }
+                return 3600
+            }
+            when failure _ then { return 3600 }
+        }
+        when failure _ then { return 3600 }
+    }
+}
+
+to sign_jwt(db: Db, id: Text, email: Text, role: Text) returns Text or fails RigError {
+    let secret = try auth_secret()
+    let exp = now() + jwt_seconds(db)
+    let iat = now()
+    let mem = try memory_db()
+    let payload_rows = try query_args(mem, "select json_object('role', ?1, 'sub', ?2, 'email', ?3, 'exp', cast(?4 as integer), 'iat', cast(?5 as integer)) as r", [role, id, email, "{exp}", "{iat}"])
+    if payload_rows.is_empty { fail RigError.Database("jwt payload") }
+    let payload = payload_rows[0].get("r") otherwise ""
+    let payload_b64 = try b64url_text(payload)
+    let signing = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{payload_b64}"
+    let sig_hex = try mac_hex(secret, signing)
+    let sig = try b64url_hex(sig_hex)
+    return "{signing}.{sig}"
+}
+
+to verify_jwt(token: Text) returns JwtClaims or fails RigError {
+    let db = try memory_db()
+    let sql = "select substr(?1, 1, instr(?1, '.') - 1) as header, substr(?1, instr(?1, '.') + 1, instr(substr(?1, instr(?1, '.') + 1), '.') - 1) as payload, substr(?1, instr(?1, '.') + instr(substr(?1, instr(?1, '.') + 1), '.') + 1) as sig"
+    let rows = try query_args(db, sql, [token])
+    if rows.is_empty { fail RigError.Unauthorized }
+    let header = rows[0].get("header") otherwise ""
+    let payload = rows[0].get("payload") otherwise ""
+    let sig = rows[0].get("sig") otherwise ""
+    if header.is_empty or payload.is_empty or sig.is_empty { fail RigError.Unauthorized }
+    let secret = try auth_secret()
+    let expected_hex = try mac_hex(secret, "{header}.{payload}")
+    let expected = try b64url_hex(expected_hex)
+    if expected != sig { fail RigError.Unauthorized }
+    let json = try b64url_decode(payload)
+    match from_json(json, as: JwtClaims) {
+        when success claims then {
+            if claims.exp < now() { fail RigError.Unauthorized }
+            return claims
+        }
+        when failure _ then { fail RigError.Unauthorized }
+    }
+}
+
+to hash_password(password: Text) returns Text or fails RigError {
+    let secret = try auth_secret()
+    let salt_full = try digest_text("{password.length}.{now()}.{Clock.millis()}")
+    let db = try memory_db()
+    let salt_rows = try query_args(db, "select substr(?1, 1, 16) as r", [salt_full])
+    let salt = salt_rows[0].get("r") otherwise ""
+    let mac = try mac_hex(secret, "{salt}.{password}")
+    return "v1${salt}{mac}"
+}
+
+to password_matches(stored: Text, password: Text) returns Bool or fails RigError {
+    if stored.length < 20 { return no }
+    let db = try memory_db()
+    let rows = try query_args(db, "select substr(?1, 4, 16) as salt, substr(?1, 20) as mac", [stored])
+    if rows.is_empty { return no }
+    let salt = rows[0].get("salt") otherwise ""
+    let expect = rows[0].get("mac") otherwise ""
+    let secret = try auth_secret()
+    let actual = try mac_hex(secret, "{salt}.{password}")
+    if actual == expect { return yes }
+    return no
+}
+
+to store_password(db: Db, id: Text, password: Text) returns Int or fails RigError {
+    if password.is_empty { return 0 }
+    let hash = try hash_password(password)
+    match db.from("auth_passwords").equals("user_id", id).first() {
+        when success maybe then match maybe {
+            when found _ then match db.from("auth_passwords").equals("user_id", id).update({"password_hash": hash}) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+            when nothing then match db.from("auth_passwords").insert({"user_id": id, "password_hash": hash}) {
+                when success count then { return count }
+                when failure error then match error {
+                    when Failed(message) then { fail RigError.Database(message) }
+                }
+            }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to issue_session(db: Db, id: Text, email: Text) returns AuthSession or fails RigError {
+    let secret = try auth_secret()
+    let access = try sign_jwt(db, id, email, "authenticated")
+    let refresh = try mac_hex(secret, "{id}.{email}.{now()}.{Clock.millis()}")
+    let token_hash = try digest_text(refresh)
+    let expires = now() + 1209600
+    let refresh_id = "rt-{Clock.millis()}"
+    match db.from("auth_refresh_tokens").insert({
+        "id": refresh_id,
+        "user_id": id,
+        "token_hash": token_hash,
+        "expires_at": "{expires}",
+    }) {
+        when success _ then {}
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+    let seconds = jwt_seconds(db)
+    return AuthSession.new(
+        access_token: access,
+        refresh_token: refresh,
+        token_type: "bearer",
+        expires_in: seconds,
+        user: AuthUserResponse.new(id: id, email: email, role: "authenticated"),
+    )
+}
+
+to min_password_length(db: Db) returns Int {
+    match config_get(db, "min_password_length") {
+        when success value then match from_json(value, as: Int) {
+            when success n then {
+                if n > 0 { return n }
+                return 6
+            }
+            when failure _ then { return 6 }
+        }
+        when failure _ then { return 6 }
+    }
+}
+
+to signup_user(body: AuthSignupBody) returns AuthSession or fails RigError {
+    if body.email.is_empty or body.password.is_empty {
+        fail RigError.BadRequest("email and password required")
+    }
+    let db = try RigRoutes.db()
+    match config_get(db, "email_enabled") {
+        when success value then {
+            if value == "false" { fail RigError.BadRequest("email signups are disabled") }
+        }
+        when failure _ then {}
+    }
+    let min_len = min_password_length(db)
+    if body.password.length < min_len {
+        fail RigError.BadRequest("password is too short")
+    }
+    match db.from("auth_users").equals("email", body.email).first() {
+        when success maybe then match maybe {
+            when found _ then { fail RigError.BadRequest("email already registered") }
+            when nothing then {}
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+    let id = "user-{Clock.millis()}"
+    match db.from("auth_users").insert({
+        "id": id,
+        "email": body.email,
+        "phone": "",
+        "provider": "email",
+        "created_at": "{now()}",
+        "last_sign_in_at": "{now()}",
+        "raw_user_meta_data": "",
+        "banned_until": "",
+    }) {
+        when success _ then {}
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+    match db.from("profiles").insert({"id": id, "email": body.email, "name": ""}) {
+        when success _ then {}
+        when failure _ then {}
+    }
+    let _p = try store_password(db, id, body.password)
+    return try issue_session(db, id, body.email)
+}
+
+to user_by_email(db: Db, email: Text) returns {Text: Text} or fails RigError {
+    match db.from("auth_users").equals("email", email).first() {
+        when success maybe then match maybe {
+            when found row then { return row }
+            when nothing then { fail RigError.Unauthorized }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to password_grant(db: Db, email: Text, password: Text) returns AuthSession or fails RigError {
+    let user = try user_by_email(db, email)
+    let id = user.get("id") otherwise ""
+    let banned = user.get("banned_until") otherwise ""
+    if not banned.is_empty {
+        match from_json(banned, as: Int) {
+            when success n then {
+                if n >= now() { fail RigError.Unauthorized }
+            }
+            when failure _ then { fail RigError.Unauthorized }
+        }
+    }
+    match db.from("auth_passwords").equals("user_id", id).first() {
+        when success maybe then match maybe {
+            when found row then {
+                let stored = row.get("password_hash") otherwise ""
+                let ok = try password_matches(stored, password)
+                if not ok { fail RigError.Unauthorized }
+            }
+            when nothing then { fail RigError.Unauthorized }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+    match db.from("auth_users").equals("id", id).update({"last_sign_in_at": "{now()}"}) {
+        when success _ then {}
+        when failure _ then {}
+    }
+    return try issue_session(db, id, email)
+}
+
+to refresh_grant(db: Db, token: Text) returns AuthSession or fails RigError {
+    if token.is_empty { fail RigError.Unauthorized }
+    let token_hash = try digest_text(token)
+    match db.from("auth_refresh_tokens").equals("token_hash", token_hash).first() {
+        when success maybe then match maybe {
+            when found row then {
+                let expires = row.get("expires_at") otherwise "0"
+                match from_json(expires, as: Int) {
+                    when success n then {
+                        if n < now() { fail RigError.Unauthorized }
+                    }
+                    when failure _ then { fail RigError.Unauthorized }
+                }
+                let user_id = row.get("user_id") otherwise ""
+                let token_id = row.get("id") otherwise ""
+                match db.from("auth_refresh_tokens").equals("id", token_id).delete() {
+                    when success _ then {}
+                    when failure _ then {}
+                }
+                match db.from("auth_users").equals("id", user_id).first() {
+                    when success maybe then match maybe {
+                        when found user then {
+                            let email = user.get("email") otherwise ""
+                            return try issue_session(db, user_id, email)
+                        }
+                        when nothing then { fail RigError.Unauthorized }
+                    }
+                    when failure error then match error {
+                        when Failed(message) then { fail RigError.Database(message) }
+                    }
+                }
+            }
+            when nothing then { fail RigError.Unauthorized }
+        }
+        when failure error then match error {
+            when Failed(message) then { fail RigError.Database(message) }
+        }
+    }
+}
+
+to token_user(body: AuthTokenBody) returns AuthSession or fails RigError {
+    let db = try RigRoutes.db()
+    if body.grant_type == "refresh_token" {
+        return try refresh_grant(db, body.refresh_token)
+    }
+    if body.email.is_empty or body.password.is_empty {
+        fail RigError.BadRequest("email and password required")
+    }
+    return try password_grant(db, body.email, body.password)
+}
+
+to current_user(headers: {Text: Text}, who: User or fails AuthError) returns AuthUserResponse or fails RigError {
+    let authorization = header_get(headers, "authorization")
+    let token = try bearer_token(authorization)
+    if not token.is_empty and token != anon_key() {
+        let claims = try verify_jwt(token)
+        return AuthUserResponse.new(id: claims.sub, email: claims.email, role: claims.role)
+    }
+    let user = try require_user(who)
+    return AuthUserResponse.new(id: user.id, email: user.email, role: "authenticated")
+}
+
+to rest_actor(headers: {Text: Text}) returns Actor or fails RigError {
+    let anon = anon_key()
+    let apikey = header_get(headers, "apikey")
+    let token = try bearer_token(header_get(headers, "authorization"))
+    if apikey == anon or token == anon {
+        return Actor.new(role: "anon", uid: "")
+    }
+    if not token.is_empty {
+        let claims = try verify_jwt(token)
+        let role = if claims.role == "anon" { "anon" } else { "authenticated" }
+        return Actor.new(role: role, uid: claims.sub)
+    }
+    fail RigError.Unauthorized
+}
+
+to studio_actor(headers: {Text: Text}) returns Actor {
+    let role = header_get(headers, "x-rig-role")
+    let uid = header_get(headers, "x-rig-user")
+    if role == "anon" { return Actor.new(role: "anon", uid: "") }
+    if role == "authenticated" { return Actor.new(role: "authenticated", uid: uid) }
+    return Actor.new(role: "postgres", uid: "")
+}
+
 # --- Mounted HTTP route groups (`mount rig_studio`, `mount rig_api`, etc.) --
 
 cast RigRoutes {
@@ -2349,37 +3302,37 @@ cast RigRoutes {
         return try list_studio_tables(db)
     }
 
-    factory list_table(table: Text) returns [{Text: Text}] or fails RigError {
+    factory list_table(table: Text, actor: Actor) returns [{Text: Text}] or fails RigError {
         let db = try RigRoutes.db()
-        let rows = try list(db, table)
+        let rows = try list_as(db, table, actor)
         let _l = log_studio(db, "api", "info", "GET", "/rest/v1/{table}", "select {table}", "200", "0")
         return rows
     }
 
-    factory get_table_row(table: Text, id: Text) returns {Text: Text} or fails RigError {
+    factory get_table_row(table: Text, id: Text, actor: Actor) returns {Text: Text} or fails RigError {
         let db = try RigRoutes.db()
-        let row = try get(db, table, id)
+        let row = try get_as(db, table, id, actor)
         let _l = log_studio(db, "api", "info", "GET", "/rest/v1/{table}/{id}", "get {table} {id}", "200", "0")
         return row
     }
 
-    factory insert_table_row(table: Text, values: {Text: Text}) returns OkCount or fails RigError {
+    factory insert_table_row(table: Text, values: {Text: Text}, actor: Actor) returns OkCount or fails RigError {
         let db = try RigRoutes.db()
-        let count = try insert_row(db, table, values)
+        let count = try insert_row_as(db, table, values, actor)
         let _l = log_studio(db, "api", "info", "POST", "/rest/v1/{table}", "insert {table}", "201", "0")
         return OkCount.new(count: count)
     }
 
-    factory patch_table_row(table: Text, id: Text, values: {Text: Text}) returns OkCount or fails RigError {
+    factory patch_table_row(table: Text, id: Text, values: {Text: Text}, actor: Actor) returns OkCount or fails RigError {
         let db = try RigRoutes.db()
-        let count = try patch_row(db, table, id, values)
+        let count = try patch_row_as(db, table, id, values, actor)
         let _l = log_studio(db, "api", "info", "PATCH", "/rest/v1/{table}/{id}", "patch {table} {id}", "200", "0")
         return OkCount.new(count: count)
     }
 
-    factory delete_table_row(table: Text, id: Text) returns OkCount or fails RigError {
+    factory delete_table_row(table: Text, id: Text, actor: Actor) returns OkCount or fails RigError {
         let db = try RigRoutes.db()
-        let count = try remove(db, table, id)
+        let count = try remove_as(db, table, id, actor)
         let _l = log_studio(db, "api", "info", "DELETE", "/rest/v1/{table}/{id}", "delete {table} {id}", "200", "0")
         return OkCount.new(count: count)
     }
@@ -2421,9 +3374,9 @@ cast RigRoutes {
         return OkCount.new(count: count)
     }
 
-    factory studio_patch(body: StudioPatchBody) returns OkCount or fails RigError {
+    factory studio_patch(body: StudioPatchBody, actor: Actor) returns OkCount or fails RigError {
         let db = try RigRoutes.db()
-        let count = try patch_studio_row(db, body)
+        let count = try patch_studio_row(db, body, actor)
         return OkCount.new(count: count)
     }
 
@@ -2442,26 +3395,26 @@ cast RigRoutes {
         return try run_studio_ddl(db, body)
     }
 
-    factory studio_row_query(body: StudioRowQuery) returns StudioRowPage or fails RigError {
+    factory studio_row_query(body: StudioRowQuery, actor: Actor) returns StudioRowPage or fails RigError {
         let db = try RigRoutes.db()
-        return try query_studio_rows(db, body)
+        return try query_studio_rows(db, body, actor)
     }
 
-    factory studio_row_insert(body: StudioRowWrite) returns OkCount or fails RigError {
+    factory studio_row_insert(body: StudioRowWrite, actor: Actor) returns OkCount or fails RigError {
         let db = try RigRoutes.db()
-        let count = try insert_studio_values(db, body)
+        let count = try insert_studio_values(db, body, actor)
         return OkCount.new(count: count)
     }
 
-    factory studio_row_patch(body: StudioRowWrite) returns OkCount or fails RigError {
+    factory studio_row_patch(body: StudioRowWrite, actor: Actor) returns OkCount or fails RigError {
         let db = try RigRoutes.db()
-        let count = try patch_studio_values(db, body)
+        let count = try patch_studio_values(db, body, actor)
         return OkCount.new(count: count)
     }
 
-    factory studio_row_delete(body: StudioRowDelete) returns OkCount or fails RigError {
+    factory studio_row_delete(body: StudioRowDelete, actor: Actor) returns OkCount or fails RigError {
         let db = try RigRoutes.db()
-        let count = try delete_studio_ids(db, body)
+        let count = try delete_studio_ids(db, body, actor)
         return OkCount.new(count: count)
     }
 
@@ -2684,8 +3637,22 @@ mount rig_auth at "/auth/v1" {
     }
 
     route get "/user" {
-        match RigRoutes.user(request.who) {
+        match current_user(request.headers, request.who) {
             when success view then { reply with view }
+            when failure error then { reply text explain(error) as "text/plain" status 401 }
+        }
+    }
+
+    route post "/signup" expecting AuthSignupBody as body {
+        match signup_user(body) {
+            when success session then { reply with session status 201 }
+            when failure error then { reply text explain(error) as "text/plain" status 400 }
+        }
+    }
+
+    route post "/token" expecting AuthTokenBody as body {
+        match token_user(body) {
+            when success session then { reply with session }
             when failure error then { reply text explain(error) as "text/plain" status 401 }
         }
     }
@@ -2695,44 +3662,74 @@ mount rig_api at "/rest/v1" {
     mount rig_health
 
     route get "/" {
-        match RigRoutes.api_tables() {
-            when success tables then { reply with tables }
-            when failure error then { reply text explain(error) as "text/plain" status 500 }
+        match rest_actor(request.headers) {
+            when success _ then match RigRoutes.api_tables() {
+                when success tables then { reply with tables }
+                when failure error then { reply text explain(error) as "text/plain" status 500 }
+            }
+            when failure _ then { reply text "unauthorized" as "text/plain" status 401 }
         }
     }
 
     route get "/{table: Text}" {
-        match RigRoutes.list_table(table) {
-            when success rows then { reply with rows }
-            when failure error then { reply text explain(error) as "text/plain" status 404 }
+        match rest_actor(request.headers) {
+            when success actor then match RigRoutes.list_table(table, actor) {
+                when success rows then { reply with rows }
+                when failure error then { reply text explain(error) as "text/plain" status 400 }
+            }
+            when failure _ then { reply text "unauthorized" as "text/plain" status 401 }
         }
     }
 
     route get "/{table: Text}/{id: Text}" {
-        match RigRoutes.get_table_row(table, id) {
-            when success row then { reply with row }
-            when failure error then { reply text explain(error) as "text/plain" status 404 }
+        match rest_actor(request.headers) {
+            when success actor then match RigRoutes.get_table_row(table, id, actor) {
+                when success row then { reply with row }
+                when failure error then {
+                    let code = http_status(error)
+                    reply text explain(error) as "text/plain" status code
+                }
+            }
+            when failure _ then { reply text "unauthorized" as "text/plain" status 401 }
         }
     }
 
     route post "/{table: Text}" expecting {Text: Text} as body {
-        match RigRoutes.insert_table_row(table, body) {
-            when success count then { reply with count status 201 }
-            when failure error then { reply text explain(error) as "text/plain" status 400 }
+        match rest_actor(request.headers) {
+            when success actor then match RigRoutes.insert_table_row(table, body, actor) {
+                when success count then { reply with count status 201 }
+                when failure error then {
+                    let code = http_status(error)
+                    reply text explain(error) as "text/plain" status code
+                }
+            }
+            when failure _ then { reply text "unauthorized" as "text/plain" status 401 }
         }
     }
 
     route patch "/{table: Text}/{id: Text}" expecting {Text: Text} as body {
-        match RigRoutes.patch_table_row(table, id, body) {
-            when success count then { reply with count }
-            when failure error then { reply text explain(error) as "text/plain" status 400 }
+        match rest_actor(request.headers) {
+            when success actor then match RigRoutes.patch_table_row(table, id, body, actor) {
+                when success count then { reply with count }
+                when failure error then {
+                    let code = http_status(error)
+                    reply text explain(error) as "text/plain" status code
+                }
+            }
+            when failure _ then { reply text "unauthorized" as "text/plain" status 401 }
         }
     }
 
     route delete "/{table: Text}/{id: Text}" {
-        match RigRoutes.delete_table_row(table, id) {
-            when success count then { reply with count }
-            when failure error then { reply text explain(error) as "text/plain" status 400 }
+        match rest_actor(request.headers) {
+            when success actor then match RigRoutes.delete_table_row(table, id, actor) {
+                when success count then { reply with count }
+                when failure error then {
+                    let code = http_status(error)
+                    reply text explain(error) as "text/plain" status code
+                }
+            }
+            when failure _ then { reply text "unauthorized" as "text/plain" status 401 }
         }
     }
 }
@@ -2894,7 +3891,7 @@ mount rig_studio_api at "/studio-api" {
 
     route post "/rows/patch" expecting StudioPatchBody as body {
         match authorize_studio(default_studio(), request.headers) {
-            when success _ then match RigRoutes.studio_patch(body) {
+            when success _ then match RigRoutes.studio_patch(body, studio_actor(request.headers)) {
                 when success count then { reply with count }
                 when failure error then {
                     reply text explain(error) as "text/plain; charset=utf-8" status 400
@@ -2922,7 +3919,7 @@ mount rig_studio_api at "/studio-api" {
 
     route post "/rows/query" expecting StudioRowQuery as body {
         match authorize_studio(default_studio(), request.headers) {
-            when success _ then match RigRoutes.studio_row_query(body) {
+            when success _ then match RigRoutes.studio_row_query(body, studio_actor(request.headers)) {
                 when success page then { reply with page }
                 when failure error then {
                     reply text explain(error) as "text/plain; charset=utf-8" status 400
@@ -2936,7 +3933,7 @@ mount rig_studio_api at "/studio-api" {
 
     route post "/rows/insert" expecting StudioRowWrite as body {
         match authorize_studio(default_studio(), request.headers) {
-            when success _ then match RigRoutes.studio_row_insert(body) {
+            when success _ then match RigRoutes.studio_row_insert(body, studio_actor(request.headers)) {
                 when success count then { reply with count status 201 }
                 when failure error then {
                     reply text explain(error) as "text/plain; charset=utf-8" status 400
@@ -2950,7 +3947,7 @@ mount rig_studio_api at "/studio-api" {
 
     route post "/rows/update" expecting StudioRowWrite as body {
         match authorize_studio(default_studio(), request.headers) {
-            when success _ then match RigRoutes.studio_row_patch(body) {
+            when success _ then match RigRoutes.studio_row_patch(body, studio_actor(request.headers)) {
                 when success count then { reply with count }
                 when failure error then {
                     reply text explain(error) as "text/plain; charset=utf-8" status 400
@@ -2964,7 +3961,7 @@ mount rig_studio_api at "/studio-api" {
 
     route post "/rows/delete" expecting StudioRowDelete as body {
         match authorize_studio(default_studio(), request.headers) {
-            when success _ then match RigRoutes.studio_row_delete(body) {
+            when success _ then match RigRoutes.studio_row_delete(body, studio_actor(request.headers)) {
                 when success count then { reply with count }
                 when failure error then {
                     reply text explain(error) as "text/plain; charset=utf-8" status 400

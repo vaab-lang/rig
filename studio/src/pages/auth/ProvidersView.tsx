@@ -90,7 +90,7 @@ export function ProvidersView() {
   const saveError = save.error instanceof Error ? save.error.message : null
 
   return (
-    <SurfacePage title="Providers" detail="Email, Google, and GitHub. Secrets are last-4 only after save.">
+    <SurfacePage title="Providers" detail="Stored, not enforced. OAuth, phone, and magic link do not run.">
       <OfflineBanner online={online} />
       {missing ? (
         <ErrorRetry

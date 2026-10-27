@@ -1,5 +1,6 @@
 import { explainStatus, insertRow, listRows, patchRow } from '@/lib/api'
-import type { ImpersonationRole } from '@/lib/role-store'
+import { readPragmaColumn } from '@/lib/columns'
+import { useRoleStore, type ImpersonationRole } from '@/lib/role-store'
 
 export class StudioApiError extends Error {
   status: number
@@ -113,6 +114,10 @@ function studioInit(init?: RequestInit, role?: ImpersonationRole): RequestInit {
   const headers = new Headers(init?.headers)
   if (!headers.has('Accept')) headers.set('Accept', 'application/json')
   if (role && role !== 'postgres') headers.set('X-Rig-Role', role)
+  if (role === 'authenticated') {
+    const uid = useRoleStore.getState().uid.trim()
+    if (uid) headers.set('X-Rig-User', uid)
+  }
   return {
     credentials: 'include',
     ...init,
@@ -171,60 +176,31 @@ function unwrapList(data: unknown): unknown[] {
   return []
 }
 
-function isPragmaColumn(raw: Record<string, unknown>): boolean {
-  return 'cid' in raw || ('notnull' in raw && 'dflt_value' in raw) || ('pk' in raw && 'notnull' in raw && 'name' in raw)
-}
-
-function normalizeColumn(raw: unknown, index: number): TableColumnMeta {
-  if (typeof raw === 'string') {
-    return {
-      name: raw,
-      type: 'text',
-      pk: raw === 'id',
-      fk: false,
-      nullable: raw !== 'id',
-      unique: raw === 'id',
-      default: null,
-    }
-  }
-  if (!raw || typeof raw !== 'object') {
-    return { name: `col_${index}`, type: 'text', pk: false, fk: false, nullable: true, unique: false, default: null }
-  }
-  const o = raw as Record<string, unknown>
-  if (isPragmaColumn(o)) {
-    const name = asString(o.name, `col_${index}`)
-    const pk = asString(o.pk) === '1' || asNumber(o.pk) === 1
-    const notNull = asString(o.notnull) === '1' || asNumber(o.notnull) === 1
-    const dflt = o.dflt_value
-    return {
-      name,
-      type: asString(o.type, 'text') || 'text',
-      pk,
-      fk: false,
-      nullable: !pk && !notNull,
-      unique: pk,
-      default: dflt == null || dflt === '' ? null : String(dflt),
-    }
-  }
-  const name = asString(o.name ?? o.column_name ?? o.key, `col_${index}`)
-  const type = asString(o.type ?? o.data_type ?? o.udt_name ?? o.typname, 'text')
-  const pk = truthy(o.pk ?? o.is_pk ?? o.primary_key) || asNumber(o.pk) === 1
-  const refTable = asString(o.fk_table ?? o.referenced_table ?? o.ref_table ?? (o.references as Record<string, unknown> | undefined)?.table)
-  const refCol = asString(o.fk_column ?? o.referenced_column ?? o.ref_column ?? (o.references as Record<string, unknown> | undefined)?.column)
-  const fk = truthy(o.fk ?? o.is_fk ?? o.foreign_key) || Boolean(refTable)
-  const notNull = truthy(o.notnull ?? o.not_null ?? o.is_not_null)
-  const nullable =
-    o.nullable !== undefined || o.is_nullable !== undefined ? truthy(o.nullable ?? o.is_nullable) : !pk && !notNull
-  const unique = truthy(o.unique ?? o.is_unique) || pk
-  const defaultValue = o.default ?? o.dflt_value ?? o.column_default
+function normalizeColumn(raw: unknown, index: number): TableColumnMeta | null {
+  const parsed = readPragmaColumn(raw, index)
+  if (!parsed) return null
+  const record = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null
+  const refTable = asString(
+    record?.fk_table ??
+      record?.referenced_table ??
+      record?.ref_table ??
+      (record?.references as Record<string, unknown> | undefined)?.table,
+  )
+  const refCol = asString(
+    record?.fk_column ??
+      record?.referenced_column ??
+      record?.ref_column ??
+      (record?.references as Record<string, unknown> | undefined)?.column,
+  )
+  const fk = truthy(record?.fk ?? record?.is_fk ?? record?.foreign_key) || Boolean(refTable)
   return {
-    name,
-    type: type || 'text',
-    pk,
+    name: parsed.name,
+    type: parsed.type,
+    pk: parsed.pk,
     fk,
-    nullable,
-    unique,
-    default: defaultValue == null ? null : String(defaultValue),
+    nullable: parsed.nullable,
+    unique: truthy(record?.unique ?? record?.is_unique) || parsed.pk,
+    default: parsed.defaultValue,
     references: refTable ? { table: refTable, column: refCol || 'id' } : null,
   }
 }
@@ -248,7 +224,7 @@ export function normalizeTable(raw: unknown): StudioTable | null {
   const kindRaw = asString(o.kind ?? o.type ?? o.relkind, 'table').toLowerCase()
   const kind: 'table' | 'view' = kindRaw.includes('view') ? 'view' : 'table'
   const columnsRaw = Array.isArray(o.columns) ? o.columns : []
-  const columns = columnsRaw.map((column, index) => normalizeColumn(column, index))
+  const columns = columnsRaw.map((column, index) => normalizeColumn(column, index)).filter((column): column is TableColumnMeta => column !== null)
   const fks = Array.isArray(o.foreign_keys) ? o.foreign_keys : Array.isArray(o.foreignKeys) ? o.foreignKeys : []
   const foreignKeys = fks.map(normalizeForeignKey).filter((item): item is TableForeignKey => Boolean(item))
   for (const fk of foreignKeys) {

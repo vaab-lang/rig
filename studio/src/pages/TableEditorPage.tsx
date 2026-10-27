@@ -7,6 +7,7 @@ import { DataGrid, type DataGridColumn } from '@/components/DataGrid'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { rowKeys, zipArrayRow } from '@/lib/columns'
 import { fetchMeta } from '@/lib/api'
 import { useRoleStore } from '@/lib/role-store'
 import {
@@ -51,6 +52,7 @@ export function TableEditorPage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const role = useRoleStore((state) => state.role)
+  const uid = useRoleStore((state) => state.uid)
   const setRole = useRoleStore((state) => state.setRole)
 
   const target = useMemo(() => parseEditorTarget(location.pathname, location.search), [location.pathname, location.search])
@@ -133,7 +135,7 @@ export function TableEditorPage() {
   const querySorts: RowSort[] = sorts.map(({ column, dir }) => ({ column, dir }))
 
   const rowsQuery = useQuery({
-    queryKey: ['studio', 'rows', activeRef?.schema, activeRef?.table, queryFilters, querySorts, page, pageSize, role],
+    queryKey: ['studio', 'rows', activeRef?.schema, activeRef?.table, queryFilters, querySorts, page, pageSize, role, uid],
     queryFn: () =>
       queryTableRows(
         {
@@ -158,21 +160,32 @@ export function TableEditorPage() {
     !unauthorized && (tablesQuery.error instanceof Error ? tablesQuery.error.message : rowsQuery.error instanceof Error ? rowsQuery.error.message : null)
 
   const columnsMeta = useMemo(() => {
-    if (activeTable?.columns.length) return activeTable.columns
+    const named = (activeTable?.columns ?? []).filter((column) => column.name.trim())
     const first = rowsQuery.data?.rows[0]
-    if (!first) return []
-    return Object.keys(first)
-      .filter((key) => !key.startsWith('__'))
-      .map((name) => ({
-        name,
-        type: 'text',
-        pk: name === 'id',
-        fk: false,
-        nullable: name !== 'id',
-        unique: name === 'id',
-        default: null,
-      }))
+    const keys = rowKeys(first)
+    const hits = named.filter((column) => keys.includes(column.name)).length
+    if (named.length && (keys.length === 0 || hits > 0 || Array.isArray(first))) return named
+    const fallback = keys.length
+      ? keys
+      : Array.isArray(first)
+        ? first.map((_, index) => `col_${index}`)
+        : []
+    return fallback.map((name) => ({
+      name,
+      type: 'text',
+      pk: name === 'id',
+      fk: false,
+      nullable: name !== 'id',
+      unique: name === 'id',
+      default: null,
+    }))
   }, [activeTable, rowsQuery.data?.rows])
+
+  const rows = useMemo(() => {
+    const raw = rowsQuery.data?.rows ?? []
+    const names = columnsMeta.map((column) => column.name)
+    return raw.map((row) => (Array.isArray(row) ? zipArrayRow(row, names) : row))
+  }, [columnsMeta, rowsQuery.data?.rows])
 
   const gridColumns: DataGridColumn[] = columnsMeta.map((column) => ({
     key: column.name,
@@ -184,7 +197,6 @@ export function TableEditorPage() {
   }))
 
   const columnNames = columnsMeta.map((column) => column.name)
-  const rows = rowsQuery.data?.rows ?? []
   const count = rowsQuery.data?.count ?? 0
   const pageCount = Math.max(1, Math.ceil(count / pageSize))
 
@@ -533,7 +545,10 @@ export function TableEditorPage() {
 
         {role !== 'postgres' ? (
           <Alert>
-            <AlertDescription>Viewing as {role}</AlertDescription>
+            <AlertDescription>
+              Viewing as {role}
+              {role === 'authenticated' && uid ? ` (${uid})` : ''}. Row policies are applied.
+            </AlertDescription>
           </Alert>
         ) : null}
         {offline ? (

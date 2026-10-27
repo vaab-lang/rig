@@ -36,7 +36,7 @@ export function TemplatesView() {
   })
 
   return (
-    <SurfacePage title="Email Templates" detail="Subject and HTML for confirm, recovery, magic link, and invite.">
+    <SurfacePage title="Email Templates" detail="Stored in this browser only. Mail is not sent.">
       <OfflineBanner online={online} />
       {templatesQuery.error ? (
         <ErrorRetry

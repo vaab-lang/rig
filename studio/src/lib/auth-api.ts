@@ -36,6 +36,7 @@ export type AuthUserBody = {
   raw_user_meta_data: string
   banned_until: string
   action: string
+  password: string
 }
 
 export type AuthPolicy = {
@@ -258,6 +259,7 @@ function authUserBody(body: Partial<AuthUserBody>): AuthUserBody {
     raw_user_meta_data: body.raw_user_meta_data ?? '',
     banned_until: body.banned_until ?? '',
     action: body.action ?? '',
+    password: body.password ?? '',
   }
 }
 

@@ -47,7 +47,7 @@ export function SmtpView() {
   })
 
   return (
-    <SurfacePage title="SMTP" detail="Outbound mail host. Password is never shown in full.">
+    <SurfacePage title="SMTP" detail="Stored, not enforced. Mail is not sent.">
       <OfflineBanner online={online} />
       {configQuery.error ? (
         <ErrorRetry

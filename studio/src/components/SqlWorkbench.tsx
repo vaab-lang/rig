@@ -343,7 +343,7 @@ export function SqlWorkbench({
 
       {role !== 'postgres' ? (
         <Alert className="rounded-none border-x-0 border-t-0">
-          <AlertDescription>Viewing as {role}</AlertDescription>
+          <AlertDescription>Viewing as {role}. SQL still runs as the gateway database user. Row policies apply to the table API, not this editor.</AlertDescription>
         </Alert>
       ) : null}
       {offline ? (

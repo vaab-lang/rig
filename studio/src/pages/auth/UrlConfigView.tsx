@@ -31,7 +31,7 @@ export function UrlConfigView() {
   })
 
   return (
-    <SurfacePage title="URL Configuration" detail="Site URL and redirect allow-list. One redirect per line.">
+    <SurfacePage title="URL Configuration" detail="Stored, not enforced. Redirects are not checked on sign-in.">
       <OfflineBanner online={online} />
       {configQuery.error ? (
         <ErrorRetry

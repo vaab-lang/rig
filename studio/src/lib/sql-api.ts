@@ -1,5 +1,6 @@
 import { explainStatus } from '@/lib/api'
-import type { ImpersonationRole } from '@/lib/role-store'
+import { readPragmaColumn } from '@/lib/columns'
+import { useRoleStore, type ImpersonationRole } from '@/lib/role-store'
 
 export type SqlRow = Record<string, unknown>
 
@@ -79,7 +80,10 @@ function studioInit(init?: RequestInit, role?: ImpersonationRole): RequestInit {
     ...init,
     headers: {
       Accept: 'application/json',
-      ...(role ? { 'X-Rig-Role': role } : {}),
+      ...(role && role !== 'postgres' ? { 'X-Rig-Role': role } : {}),
+      ...(role === 'authenticated' && useRoleStore.getState().uid.trim()
+        ? { 'X-Rig-User': useRoleStore.getState().uid.trim() }
+        : {}),
       ...init?.headers,
     },
   }
@@ -211,18 +215,16 @@ function normalizeSnippet(value: unknown, local = false): SqlSnippet | null {
 }
 
 function pragmaColumn(row: Record<string, string>): PgMetaColumn | null {
-  const name = row.name
-  if (!name) return null
-  const pk = row.pk === '1' || row.pk === 'true'
-  const notNull = row.notnull === '1' || row.notnull === 'true'
+  const parsed = readPragmaColumn(row)
+  if (!parsed) return null
   return {
-    name,
-    type: row.type || 'TEXT',
-    pk,
-    nullable: !notNull && !pk,
-    cid: row.cid ?? '',
-    notnull: row.notnull ?? '',
-    dflt_value: row.dflt_value ?? '',
+    name: parsed.name,
+    type: parsed.type,
+    pk: parsed.pk,
+    nullable: parsed.nullable,
+    cid: parsed.cid,
+    notnull: parsed.notnull,
+    dflt_value: parsed.dflt_value,
   }
 }
 

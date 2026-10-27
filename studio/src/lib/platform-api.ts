@@ -1,5 +1,5 @@
 import { explainStatus, fetchAuthHealth, fetchHealth, type Health } from '@/lib/api'
-import type { ImpersonationRole } from '@/lib/role-store'
+import { useRoleStore, type ImpersonationRole } from '@/lib/role-store'
 
 const jsonHeaders = {
   Accept: 'application/json',
@@ -146,6 +146,9 @@ function studioInit(init?: RequestInit, role?: ImpersonationRole): RequestInit {
     headers: {
       Accept: 'application/json',
       ...(role && role !== 'postgres' ? { 'X-Rig-Role': role } : {}),
+      ...(role === 'authenticated' && useRoleStore.getState().uid.trim()
+        ? { 'X-Rig-User': useRoleStore.getState().uid.trim() }
+        : {}),
       ...init?.headers,
     },
   }
